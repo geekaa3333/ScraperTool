@@ -28,6 +28,8 @@
 import { getMarketplaceStrict, type Marketplace } from './marketplaces.js';
 
 /** Where a currency came from, and how much to trust it. */
+export { AMBIGUOUS_DOLLAR };
+
 export type CurrencyStatus =
   /** Read from a currency token Amazon rendered on the page. */
   | 'VERIFIED_FROM_PAGE'
@@ -72,8 +74,20 @@ export function resolveCurrency(
   marketplace?: Marketplace | null,
 ): ResolvedCurrency {
   const mp = marketplace ?? getMarketplaceStrict(marketplaceId);
+  // Tested BEFORE normalisation: normaliseCode strips everything but three
+  // letters, which would discard the ambiguous marker entirely.
+  const rawObserved = typeof observedCode === 'string' ? observedCode.trim() : null;
   const observed = normaliseCode(observedCode);
   const expected = mp?.currency ?? null;
+
+  // A bare '$' was printed. That confirms the marketplace's currency, because a
+  // marketplace does not display prices in a foreign symbol by accident. So it
+  // is page evidence, just not evidence of a currency in its own right.
+  if (rawObserved === AMBIGUOUS_DOLLAR) {
+    if (expected) return { code: expected, status: 'VERIFIED_FROM_PAGE', mismatch: false };
+    // No marketplace to resolve it against, so '$' tells us nothing.
+    return { code: null, status: 'UNVERIFIED', mismatch: false };
+  }
 
   // A currency the page rendered is the most direct evidence there is.
   if (observed) {
@@ -125,15 +139,25 @@ export function isSingleCurrency(codes: Array<string | null>): boolean {
  * page displayed that the marketplace does *not* use, which is exactly the case
  * that must be flagged rather than silently corrected.
  */
+/**
+ * Marker for a bare '$', shared by markets that do not use it alone.
+ *
+ * It is real evidence that a dollar-denominated price was displayed; it just is
+ * not evidence of WHICH dollar currency. The marketplace supplies that.
+ */
+const AMBIGUOUS_DOLLAR = '$AMBIGUOUS';
+
 const ALL_TOKENS: Array<[string, string]> = [
   // Symbols and codes, longest first so `ca$` wins over `$`.
   ['ca$', 'CAD'], ['cdn$', 'CAD'], ['c$', 'CAD'], ['cad', 'CAD'],
   ['us$', 'USD'], ['usd', 'USD'],
-  // A bare '$' is deliberately ABSENT from this table. amazon.ca and amazon.com
-  // both render it, and it is genuinely ambiguous between USD and CAD. Treating
-  // it as evidence of USD would flag every Canadian listing as a currency
-  // mismatch. The marketplace decides when a token is ambiguous; only an
-  // unambiguous token (`CA$`, `US$`, `USD`, `CAD`) counts as evidence.
+  // A bare '$' is reported as AMBIGUOUS_DOLLAR rather than as a currency code.
+  // It genuinely does not identify a currency on its own — it is shared by
+  // amazon.com and amazon.ca — but it is not the absence of evidence either:
+  // the page printed it, so it confirms whatever the marketplace uses. Mapping it
+  // to USD here would relabel every Canadian listing as USD and flag it as a
+  // mismatch, which is the exact bug this file replaces.
+  ['$', AMBIGUOUS_DOLLAR],
   ['gbp', 'GBP'], ['£', 'GBP'],
   ['aed', 'AED'], ['د.إ', 'AED'], ['د إ', 'AED'], ['درهم', 'AED'], ['dhs', 'AED'],
   ['sar', 'SAR'], ['ر.س', 'SAR'], ['ر س', 'SAR'], ['ر.ي', 'SAR'], ['ريال', 'SAR'], ['س.ر', 'SAR'], ['srls', 'SAR'],

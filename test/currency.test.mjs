@@ -17,6 +17,7 @@ import {
   detectCurrencyInText,
   currencyCodeFor,
   isSingleCurrency,
+  AMBIGUOUS_DOLLAR,
 } from '../dist/currency.js';
 import { rowsForProduct, toTsv, toWorkbook } from '../dist/exports.js';
 import { SqliteStore } from '../dist/pg/sqlite-store.js';
@@ -102,13 +103,32 @@ test('currency codes abutting a digit are detected', () => {
   assert.equal(detectCurrencyInText('some USDollar text'), null);
 });
 
-test('a bare dollar sign is ambiguous and is not currency evidence', () => {
-  // amazon.ca and amazon.com both render '$'. Reading it as USD would flag
-  // every Canadian listing as a mismatch, and reading it as CAD would flag
-  // every US one. An ambiguous token is not evidence: the marketplace decides.
-  assert.equal(detectCurrencyInText('$19.99'), null);
-  assert.equal(detectCurrencyInText('$19.99 USD'), 'USD', 'an explicit code still counts');
-  assert.equal(resolveCurrency('ca', detectCurrencyInText('$36.99')).status, 'VERIFIED_FROM_MARKETPLACE');
+test('a bare dollar sign is resolved by the marketplace it appears on', () => {
+  // '$' does not identify a currency on its own -- amazon.com and amazon.ca both
+  // print it -- but it is not the absence of evidence either. A marketplace does
+  // not print a foreign symbol by accident, so seeing '$' confirms whichever
+  // dollar currency this marketplace uses. Reading it as USD would flag every
+  // Canadian listing as a mismatch; reading it as CAD would flag every US one.
+  assert.equal(detectCurrencyInText('$19.99'), AMBIGUOUS_DOLLAR);
+  assert.equal(detectCurrencyInText('$19.99 USD'), 'USD', 'an explicit code still wins');
+
+  // us -> USD, ca -> CAD, both verified from what the page actually printed.
+  assert.deepEqual(resolveCurrency('us', detectCurrencyInText('$19.99')), {
+    code: 'USD', status: 'VERIFIED_FROM_PAGE', mismatch: false,
+  });
+  assert.deepEqual(resolveCurrency('ca', detectCurrencyInText('$36.99')), {
+    code: 'CAD', status: 'VERIFIED_FROM_PAGE', mismatch: false,
+  });
+
+  // With no marketplace to resolve it against, '$' genuinely says nothing.
+  assert.equal(resolveCurrency('cairo', detectCurrencyInText('$36.99')).code, null);
+});
+
+test('the pound is GBP everywhere it appears', () => {
+  assert.equal(detectCurrencyInText('£12.99'), 'GBP');
+  assert.equal(resolveCurrency('uk', detectCurrencyInText('£12.99')).code, 'GBP');
+  // £ is unambiguous, so it is evidence even when the marketplace is unknown.
+  assert.equal(resolveCurrency('cairo', detectCurrencyInText('£12.99')).code, 'GBP');
 });
 
 test('a bare number carries no currency information', () => {
