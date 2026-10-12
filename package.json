@@ -1,0 +1,63 @@
+{
+  "name": "scraper-tool",
+  "version": "2.0.0",
+  "description": "Scraper Tool \u2014 self-hosted Amazon.eg seller & delivery intelligence with single-ASIN search and bulk ASIN batch scraping",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "sellerctrl": "dist/server.js",
+    "amazon-scraper-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "public"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/server.js",
+    "serve": "node dist/server.js",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/",
+    "test:fast": "node --test test/",
+    "mcp": "node dist/index.js",
+    "prepublishOnly": "npm run build",
+    "bench": "npm run build && node scripts/benchmark.mjs",
+    "bench:live": "npm run build && node scripts/live-compare.mjs",
+    "prepare:netlify": "node scripts/prepare-netlify-config.mjs",
+    "deploy:netlify": "npm run prepare:netlify && netlify deploy --prod",
+    "worker": "npm run build && node dist/worker-main.js",
+    "worker:start": "node dist/worker-main.js"
+  },
+  "keywords": [
+    "amazon",
+    "playwright",
+    "scraper",
+    "seller",
+    "price-comparison",
+    "sqlite"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1149.0",
+    "@aws-sdk/s3-request-presigner": "^3.1149.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "better-sqlite3": "^12.4.1",
+    "cheerio": "^1.2.0",
+    "exceljs": "^4.4.0",
+    "pg": "^8.23.1",
+    "playwright": "^1.64.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cheerio": "^0.22.35",
+    "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
+    "typescript": "^5.9.3"
+  }
+}

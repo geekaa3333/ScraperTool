@@ -1,0 +1,34 @@
+# Keep the build context small and keep secrets out of it.
+#
+# A `.dockerignore` is a security control, not just a speed control: anything
+# listed here can never end up in an image layer, where it would persist even
+# after a later layer deletes it.
+
+node_modules
+dist
+data
+*.db
+*.db-shm
+*.db-wal
+
+# Never bake secrets into an image.
+.env
+.env.*
+!.env.example
+
+.git
+.gitignore
+
+# Large test fixtures are not needed at runtime.
+test/fixtures
+
+# Local artefacts
+npm-debug.log*
+*.log
+.DS_Store
+coverage
+.vscode
+.idea
+
+README.md
+scripts

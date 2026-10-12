@@ -1,0 +1,72 @@
+# Scraper Tool — background worker image.
+#
+# Same base image as the API, because the worker is what actually drives
+# Chromium. It is a *separate container* on purpose: a worker restart or an OOM
+# kill must never take the API (and therefore the dashboard) down with it, and
+# the worker can be restarted or scaled without a frontend deploy.
+#
+# Two important differences from the API image:
+#   * Chromium memory grows over a multi-day run, so this image is intended to
+#     be given a memory limit and a restart policy rather than run forever in
+#     one process. The queue is durable, so a restart costs at most one ASIN.
+#   * There is no port to expose; the worker takes no HTTP traffic at all.
+
+FROM mcr.microsoft.com/playwright:v1.48.2-jammy
+
+USER root
+
+# tini reaps the Chromium process tree. Without an init, a browser that is
+# replaced after a crash can leave renderers behind as zombies, which matters
+# enormously for a process expected to run for days.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev || npm install --omit=dev
+
+COPY tsconfig.json ./
+COPY src ./src
+COPY public ./public
+COPY migrations ./migrations
+
+RUN npm run build
+
+RUN useradd -m -u 10002 scraper \
+ && mkdir -p /app/data \
+ && chown -R scraper:scraper /app
+USER scraper
+
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=4310 \
+    SELLERCTRL_DB=/app/data/sellerctrl.db
+
+# Proves the process is alive and shows that the queue is reachable. This is a
+# liveness check, not a readiness check: the worker is "ready" whenever it can
+# reach PostgreSQL, which it re-verifies continuously by polling.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+  CMD test -f /app/dist/worker-main.js || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "dist/worker-main.js"]
+
+# ---------------------------------------------------------------------------
+# Deployment notes
+# ---------------------------------------------------------------------------
+#
+# Required environment:
+#   DATABASE_URL              postgresql://…   (mandatory; the queue lives here)
+#   S3_BUCKET + credentials   optional; reports otherwise go to REPORT_STORAGE_DIR
+#   WORKER_LEASE_MS           default 300000   (a crashed worker's item frees after this)
+#   WORKER_POLL_INTERVAL_MS   default 5000     (how often an idle worker looks for work)
+#   WORKER_MEMORY_LIMIT_MB    default 3072     (recycles Chromium above this)
+#
+# Restart policy: ALWAYS. The queue is durable, so restarting is safe and is the
+# intended recovery path.
+#
+# There is no maximum job runtime anywhere in the worker. Lease, poll and memory
+# settings bound how long a *single ASIN* may hold a claim, not how long a job
+# may run.

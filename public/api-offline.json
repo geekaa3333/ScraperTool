@@ -1,0 +1,5 @@
+{
+  "error": "The SellerCtrl API is not configured on this deployment yet.",
+  "detail": "This site's /api/* proxy has no backend origin. Register, login, uploads and history are unavailable until the API and worker are deployed and BACKEND_URL is set.",
+  "kind": "error"
+}

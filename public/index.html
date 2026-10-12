@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Scraper Tool — Amazon.eg Seller Comparison</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>📦</text></svg>" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">📦</span>
+        <div>
+          <h1>Scraper Tool</h1>
+          <p class="sub">Amazon.eg seller &amp; delivery intelligence — self-hosted, no paid API</p>
+        </div>
+      </div>
+      <div class="status" id="status"></div>
+      <a class="btn" href="/history" style="margin-left:.75rem;white-space:nowrap;">My History</a>
+    </header>
+
+    <!-- ── tabs: existing single search + new bulk scraper ────── -->
+    <nav class="tabs">
+      <button class="tab active" data-tab="single">Single ASIN Search</button>
+      <button class="tab" data-tab="bulk">Bulk ASIN Scraper</button>
+    </nav>
+
+    <main>
+      <!-- ════ existing single-ASIN tab ════ -->
+      <div id="tab-single">
+
+      <section class="panel">
+        <div class="controls">
+          <label class="field">
+            <span>Amazon marketplace</span>
+            <select id="marketplace"></select>
+          </label>
+
+          <label class="field grow">
+            <span>ASIN or product URL</span>
+            <input id="asin" type="text" placeholder="B0DLHDLC1N or https://www.amazon.eg/dp/B0DLHDLC1N" />
+          </label>
+
+          <label class="field">
+            <span>Delivery destination</span>
+            <select id="destination"></select>
+          </label>
+
+          <label class="field">
+            <span>Sort by</span>
+            <select id="sort">
+              <option value="total">Lowest total price</option>
+              <option value="delivery">Fastest delivery</option>
+              <option value="rating">Seller rating</option>
+              <option value="none">Original order</option>
+            </select>
+          </label>
+
+          <button id="go" class="primary">Search product</button>
+        </div>
+        <p class="hint" id="detectedMarketplace" hidden></p>
+        <p class="hint" id="destinationHint"></p>
+      </section>
+
+      <div id="banner" class="banner hidden"></div>
+
+      <!-- ── product ───────────────────────────────────────────── -->
+      <section id="productPanel" class="panel hidden">
+        <div class="product">
+          <img id="productImage" alt="" />
+          <div class="product-info">
+            <h2 id="productTitle"></h2>
+            <p class="meta">
+              <span id="productBrand"></span>
+              <span class="dot">•</span>
+              <span id="productAsin"></span>
+              <span class="dot">•</span>
+              <span id="productRating"></span>
+            </p>
+            <div class="meta" id="productDestination"></div>
+          <p class="meta" id="productMarketplace"></p>
+          </div>
+          <a id="productLink" class="ghost" target="_blank" rel="noreferrer noopener">Open on Amazon ↗</a>
+        </div>
+
+        <div class="stats" id="stats"></div>
+      </section>
+
+      <!-- ── offers table ─────────────────────────────────────── -->
+      <section id="offersPanel" class="panel hidden">
+        <div class="panel-head">
+          <h2>Seller offers <span class="count" id="offerCount"></span></h2>
+          <div class="actions">
+            <button id="exportCsv" class="ghost small">Export CSV</button>
+            <button id="exportXlsx" class="ghost small">Export Excel</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="offers">
+            <thead>
+              <tr>
+                <th>Seller</th>
+                <th class="num">Price</th>
+                <th class="num">Shipping</th>
+                <th class="num">Total</th>
+                <th>Delivery date</th>
+                <th class="num">Days</th>
+                <th>Fulfilment</th>
+                <th class="num">Rating</th>
+                <th>Buy Box</th>
+              </tr>
+            </thead>
+            <tbody id="offersBody"></tbody>
+          </table>
+        </div>
+        <p class="note" id="completenessNote"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Search the marketplace</h2>
+        <div class="controls">
+          <label class="field grow">
+            <span>Keyword</span>
+            <input id="searchQuery" type="text" placeholder="usb c hub" />
+          </label>
+          <button id="searchGo" class="ghost">Search</button>
+        </div>
+        <div id="searchResults" class="results"></div>
+      </section>
+      </div>
+
+      <!-- ════ new Bulk ASIN Scraper tab ════ -->
+      <div id="tab-bulk" class="hidden">
+
+        <!-- step 1: upload -->
+        <section class="panel">
+          <h2>1 · Choose a mode &amp; upload</h2>
+
+          <div class="mode-row" id="modeRow">
+            <label class="mode">
+              <input type="radio" name="bulkMode" value="direct-upload" checked />
+              <span class="mode-title">Multi-Region Direct Upload</span>
+              <span class="mode-desc">One Excel per marketplace. No marketplace detection — every ASIN goes straight to its own Amazon site.</span>
+            </label>
+            <label class="mode">
+              <input type="radio" name="bulkMode" value="single-marketplace" />
+              <span class="mode-title">Single Marketplace</span>
+              <span class="mode-desc">Every ASIN is searched in one marketplace you pick.</span>
+            </label>
+            <label class="mode">
+              <input type="radio" name="bulkMode" value="region-column" />
+              <span class="mode-title">Mixed — Region column</span>
+              <span class="mode-desc">Your sheet supplies a Region / Marketplace column.</span>
+            </label>
+            <label class="mode mode-legacy">
+              <input type="radio" name="bulkMode" value="auto-detect" />
+              <span class="mode-title">Mixed — Auto Detect <em>(legacy)</em></span>
+              <span class="mode-desc">Probes every selected marketplace per ASIN. Costs one page load per region per ASIN — kept for compatibility, not used by Direct Upload.</span>
+            </label>
+          </div>
+
+          <!-- Direct Upload: one enable/disable + file input per marketplace -->
+          <div id="directPanel" class="direct-panel">
+            <div class="direct-head">
+              <h3>Amazon marketplaces</h3>
+              <p class="hint">
+                A file uploaded under a marketplace belongs to that marketplace. Its ASINs are
+                scraped there directly — no cross-region availability checks are performed.
+              </p>
+            </div>
+            <div id="directRows" class="direct-rows"></div>
+            <div class="controls">
+              <label class="field">
+                <span>Cached data</span>
+                <select id="directFreshness">
+                  <option value="reuse">Use recent cached data</option>
+                  <option value="refresh">Refresh live data</option>
+                </select>
+              </label>
+              <span class="spacer"></span>
+              <button id="directStart" class="primary">Start all enabled marketplaces</button>
+            </div>
+            <p class="hint" id="directSummary"></p>
+          </div>
+
+          <div class="controls" style="margin-top:16px">
+            <label class="field" id="singleMarketField">
+              <span>Marketplace</span>
+              <select id="bulkMarketplace"></select>
+            </label>
+
+            <fieldset class="detect-box hidden" id="detectBox">
+              <legend>Auto detection — check these marketplaces</legend>
+              <div class="checks" id="detectChecks"></div>
+              <p class="hint">
+                Each ASIN is checked against every selected marketplace. A check is a real
+                page load, so the work grows quickly — the planned total is shown before you start.
+              </p>
+            </fieldset>
+
+            <label class="field grow" id="bulkFileField">
+              <span>Excel file (.xlsx)</span>
+              <input id="bulkFile" type="file" accept=".xlsx" />
+            </label>
+            <label class="field" id="bulkDestinationField">
+              <span>Delivery destination</span>
+              <select id="bulkDestination"></select>
+            </label>
+            <button id="bulkUpload" class="primary">Upload</button>
+          </div>
+
+          <p class="hint" id="bulkDestinationNote" hidden>
+            Mixed-marketplace batches do not use a shared delivery destination. Each
+            marketplace is handled with its own location, and anything not configured
+            for that marketplace is left as Amazon's own default rather than being
+            assumed.
+          </p>
+
+          <div id="bulkColumnPicker" class="hidden sub-panel">
+            <label class="field">
+              <span>Identifier column</span>
+              <select id="bulkColumn"></select>
+            </label>
+            <label class="field">
+              <span>Region column (optional)</span>
+              <select id="bulkRegionColumn"></select>
+            </label>
+            <label class="field">
+              <span>URL column (optional)</span>
+              <select id="bulkUrlColumn"></select>
+            </label>
+            <button id="bulkColumnConfirm" class="ghost">Use these columns</button>
+          </div>
+
+          <details class="paste">
+            <summary>Or paste ASINs or Amazon URLs directly</summary>
+            <textarea id="bulkPaste" rows="4" placeholder="One per line: a 10-character ASIN, or a full Amazon product URL"></textarea>
+            <button id="bulkPasteGo" class="ghost small">Queue pasted identifiers</button>
+          </details>
+
+          <p class="hint">
+            The ASIN and Region columns are detected automatically (headers such as
+            <code>ASIN</code>, <code>Product ASIN</code>, <code>SKU</code>, <code>Region</code>,
+            <code>Marketplace</code>, <code>Product URL</code>). Blank rows and duplicates are removed.
+            Nothing is scraped until you press Start.
+          </p>
+        </section>
+
+        <!-- step 2: preview -->
+        <section id="bulkQueuePanel" class="panel hidden">
+          <h2>2 · Preview &amp; start</h2>
+          <div class="stats" id="bulkImportStats"></div>
+          <p class="hint" id="bulkWorkload"></p>
+          <div id="bulkInvalid" class="warn-block hidden"></div>
+
+          <div class="table-wrap preview-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Row</th><th>ASIN</th><th>Detected region</th>
+                  <th>Marketplace</th><th>Status</th><th>Method</th>
+                </tr>
+              </thead>
+              <tbody id="bulkPreviewBody"></tbody>
+            </table>
+          </div>
+
+          <div class="controls" style="margin-top:14px">
+            <button id="bulkStart" class="primary">Start batch</button>
+            <button id="bulkDetect" class="ghost hidden">Run marketplace detection</button>
+          </div>
+        </section>
+
+        <!-- step 3: progress -->
+        <section id="bulkProgressPanel" class="panel hidden">
+          <h2>3 · Batch progress</h2>
+          <div class="progress-head">
+            <div class="progress-bar"><div id="bulkBar" class="progress-fill"></div></div>
+            <span id="bulkPercent" class="progress-pct">0%</span>
+          </div>
+
+          <!-- Multi-region per-marketplace breakdown -->
+          <div class="stage" id="bulkMultiRegionStage" hidden>
+            <div class="stage-head">
+              <h3>Multi-Region Scraping Progress</h3>
+              <span class="stage-pct" id="bulkMultiRegionPct">0%</span>
+            </div>
+            <div class="stats" id="bulkMultiRegionStats"></div>
+            <p class="hint" id="bulkMultiRegionNote"></p>
+            <div id="bulkMarketList" class="market-list"></div>
+          </div>
+
+          <!-- Stage 1 -->
+          <div class="stage" id="bulkDetectStage">
+            <div class="stage-head">
+              <h3 id="bulkDetectTitle">Marketplace Detection</h3>
+              <span class="stage-pct" id="bulkDetectPct">0%</span>
+            </div>
+            <div class="stats" id="bulkDetectStats"></div>
+            <p class="hint" id="bulkDetectCurrent"></p>
+          </div>
+
+          <!-- Stage 2 -->
+          <div class="stage" id="bulkScrapeStage">
+            <div class="stage-head">
+              <h3>Seller Data Extraction</h3>
+              <span class="stage-pct" id="bulkScrapePct">0%</span>
+            </div>
+            <div class="stats" id="bulkScrapeStats"></div>
+            <p class="hint" id="bulkEta"></p>
+          </div>
+
+          <!-- Stage 3 -->
+          <div class="stage" id="bulkResultsStage">
+            <div class="stage-head">
+              <h3>Final Results</h3>
+            </div>
+            <div class="stats" id="bulkResultsStats"></div>
+          </div>
+
+          <p id="bulkBlocked" class="warn-block hidden"></p>
+
+          <div class="controls">
+            <button id="bulkPause" class="ghost">Pause</button>
+            <button id="bulkResume" class="ghost">Resume</button>
+            <button id="bulkCancel" class="ghost">Cancel</button>
+            <button id="bulkRetry" class="ghost">Retry failed</button>
+            <span class="spacer"></span>
+            <button id="bulkDiagnostics" class="ghost">Diagnostics (optional)</button>
+            <button id="bulkXlsx" class="primary">Download Excel</button>
+            <button id="bulkTsv" class="ghost">Download TXT</button>
+            <button id="bulkCopy" class="ghost">Copy All Results</button>
+          </div>
+        </section>
+
+        <!-- step 4: results -->
+        <section id="bulkResultsPanel" class="panel hidden">
+          <div class="panel-head">
+            <h2>4 · Results <span class="count" id="bulkResultCount"></span></h2>
+          </div>
+
+          <div class="controls filters">
+            <label class="field grow"><span>Search ASIN / seller</span>
+              <input id="bulkFilter" type="text" placeholder="B0… or seller name" />
+            </label>
+            <label class="field"><span>Marketplace</span>
+              <select id="bulkFilterMarket"><option value="">All</option></select>
+            </label>
+            <label class="field"><span>Detection status</span>
+              <select id="bulkFilterDetection">
+                <option value="">All</option>
+                <option value="CONFIRMED_FOUND">Confirmed found</option>
+                <option value="MULTIPLE_MARKETPLACES">Multiple marketplaces</option>
+                <option value="PROVIDED">Provided by user</option>
+                <option value="CONFIRMED_NOT_FOUND">Not available</option>
+                <option value="UNKNOWN">Unverified</option>
+              </select>
+            </label>
+            <label class="field"><span>Fulfilment</span>
+              <select id="bulkFilterFul">
+                <option value="">All</option>
+                <option value="FBA">FBA</option>
+                <option value="FBM">FBM</option>
+              </select>
+            </label>
+            <label class="field"><span>Buy Box</span>
+              <select id="bulkFilterBuybox">
+                <option value="">All</option>
+                <option value="yes">Winners only</option>
+              </select>
+            </label>
+            <label class="field"><span>Sort by</span>
+              <select id="bulkSort">
+                <option value="row">Upload order</option>
+                <option value="total">Lowest total price</option>
+                <option value="price">Lowest seller price</option>
+                <option value="delivery">Earliest delivery date</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="table-wrap">
+            <table id="bulkTable">
+              <thead>
+                <tr>
+                  <th>Marketplace</th><th>ASIN</th><th>Seller</th><th class="num">Price</th>
+                  <th class="num">Ship</th><th class="num">Total</th>
+                  <th>Delivery</th><th class="num">Days</th><th>Ful</th>
+                  <th class="num">Rating</th><th>Buy Box</th><th>Detected</th><th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="bulkBody"></tbody>
+            </table>
+          </div>
+
+          <div class="pager">
+            <button id="bulkPrev" class="ghost small">Prev</button>
+            <span id="bulkPageInfo"></span>
+            <button id="bulkNext" class="ghost small">Next</button>
+          </div>
+          <p class="note">
+            Exports always contain <strong>every</strong> completed record in the batch,
+            not only the rows shown on this page.
+          </p>
+        </section>
+      </div>
+    </main>
+
+    <footer>
+      <p>
+        Local Playwright scraper · SQLite history · no SerpApi / Rainforest / Seller Central login ·
+        stops on CAPTCHA, 403 and 429 without attempting to bypass them.
+      </p>
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

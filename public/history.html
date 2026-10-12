@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Scraping History — SellerCtrl</title>
+<link rel="stylesheet" href="/styles.css">
+<style>
+  /* Page-local styles. The scraper UI keeps its own stylesheet untouched. */
+  .auth-shell { max-width: 420px; margin: 4rem auto; padding: 0 1.25rem; }
+  .auth-card { background: var(--panel, #fff); border: 1px solid var(--border, #e3e3e3);
+               border-radius: 12px; padding: 1.75rem; }
+  .auth-card h1 { margin: 0 0 .35rem; font-size: 1.35rem; }
+  .auth-card p.sub { margin: 0 0 1.5rem; color: #666; font-size: .9rem; }
+  .field { margin-bottom: .9rem; }
+  .field label { display: block; font-size: .8rem; font-weight: 600; margin-bottom: .3rem; }
+  .field input, .field select {
+    width: 100%; padding: .55rem .7rem; border: 1px solid #ccc; border-radius: 6px;
+    font: inherit; background: #fff; color: inherit;
+  }
+  .field input:focus, .field select:focus { outline: 2px solid #4a90d9; outline-offset: 1px; }
+  .auth-actions { display: flex; gap: .5rem; margin-top: 1.1rem; }
+  .btn { padding: .55rem 1rem; border-radius: 6px; border: 1px solid #ccc; background: #f6f6f6;
+         font: inherit; cursor: pointer; }
+  .btn-primary { background: #2c6fad; border-color: #2c6fad; color: #fff; }
+  .btn:disabled { opacity: .55; cursor: not-allowed; }
+  .alert { padding: .6rem .8rem; border-radius: 6px; margin-bottom: 1rem; font-size: .9rem; }
+  .alert-error { background: #fdecec; color: #8a1f1f; border: 1px solid #f3c2c2; }
+  .alert-ok { background: #eaf6ec; color: #1d5c2c; border: 1px solid #bfe0c7; }
+  .hidden { display: none !important; }
+
+  .toolbar { display: flex; flex-wrap: wrap; gap: .6rem; align-items: flex-end; margin-bottom: 1rem; }
+  .toolbar .field { margin: 0; min-width: 150px; }
+  .table-wrap { overflow-x: auto; }
+  table.history { width: 100%; border-collapse: collapse; font-size: .88rem; }
+  table.history th, table.history td { padding: .55rem .6rem; text-align: left;
+                                        border-bottom: 1px solid var(--border, #e9e9e9); white-space: nowrap; }
+  table.history th { font-size: .74rem; text-transform: uppercase; letter-spacing: .03em;
+                     color: #666; cursor: pointer; user-select: none; }
+  table.history tbody tr:hover { background: #fafafa; }
+  .pill { display: inline-block; padding: .1rem .45rem; border-radius: 999px;
+          font-size: .72rem; font-weight: 600; }
+  .pill-COMPLETED { background: #e6f4ea; color: #1d5c2c; }
+  .pill-RUNNING { background: #e7f0fb; color: #1b4f8a; }
+  .pill-FAILED, .pill-CANCELLED { background: #fdecec; color: #8a1f1f; }
+  .pill-PAUSED, .pill-PENDING { background: #fdf3e2; color: #8a5a11; }
+  .muted { color: #888; }
+  .pager { display: flex; gap: .6rem; align-items: center; margin-top: 1rem; }
+  .dialog-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex;
+                     align-items: center; justify-content: center; padding: 1.5rem; z-index: 50; }
+  .dialog { background: #fff; border-radius: 12px; padding: 1.5rem; max-width: 720px;
+            width: 100%; max-height: 85vh; overflow: auto; }
+  .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: .7rem; }
+  .kv div { background: #fafafa; border-radius: 8px; padding: .55rem .7rem; }
+  .kv strong { display: block; font-size: .72rem; color: #666; text-transform: uppercase; }
+  .downloads a { display: inline-block; margin-right: .6rem; margin-top: .5rem; }
+</style>
+</head>
+<body>
+
+<!-- ─────────────────────────── signed out ─────────────────────────── -->
+<div id="auth-view" class="auth-shell hidden">
+  <div class="auth-card">
+    <h1 id="auth-title">Sign in</h1>
+    <p class="sub" id="auth-sub">Access your scraping history and reports.</p>
+
+    <div id="auth-error" class="alert alert-error hidden" role="alert"></div>
+    <div id="auth-ok" class="alert alert-ok hidden" role="status"></div>
+
+    <form id="auth-form" autocomplete="on">
+      <div class="field" id="name-field" hidden>
+        <label for="displayName">Display name</label>
+        <input id="displayName" name="name" autocomplete="name">
+      </div>
+      <div class="field">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password"
+               autocomplete="current-password" required minlength="12">
+      </div>
+      <div class="auth-actions">
+        <button type="submit" class="btn btn-primary" id="auth-submit">Sign in</button>
+        <button type="button" class="btn" id="auth-toggle">Create an account</button>
+        <button type="button" class="btn hidden" id="auth-forgot">Forgot password?</button>
+      </div>
+    </form>
+
+    <p class="sub" style="margin-top:1.25rem">
+      <a href="/">← Back to the scraper</a>
+    </p>
+  </div>
+</div>
+
+<!-- ─────────────────────────── signed in ─────────────────────────── -->
+<div id="history-view" class="hidden" style="padding: 1.5rem 1.25rem 3rem;">
+  <header style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+    <div>
+      <h1 style="margin:0;font-size:1.4rem;">My Scraping History</h1>
+      <p class="muted" style="margin:.25rem 0 0;font-size:.88rem;" id="who"></p>
+    </div>
+    <div style="display:flex;gap:.5rem;align-items:center;">
+      <a class="btn" href="/">Open the scraper</a>
+      <button class="btn" id="logout">Sign out</button>
+    </div>
+  </header>
+
+  <div id="history-error" class="alert alert-error hidden" style="margin-top:1rem;" role="alert"></div>
+
+  <form class="toolbar" id="filters" style="margin-top:1.25rem;">
+    <div class="field" style="min-width:220px;">
+      <label for="q">Search</label>
+      <input id="q" placeholder="Job name, job id, or marketplace">
+    </div>
+    <div class="field">
+      <label for="f-market">Marketplace</label>
+      <select id="f-market"><option value="">All marketplaces</option></select>
+    </div>
+    <div class="field">
+      <label for="f-status">Status</label>
+      <select id="f-status">
+        <option value="">Any status</option>
+        <option value="COMPLETED">Completed</option>
+        <option value="RUNNING">Running</option>
+        <option value="PAUSED">Paused</option>
+        <option value="PENDING">Pending</option>
+        <option value="FAILED">Failed</option>
+        <option value="CANCELLED">Cancelled</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="f-from">From</label>
+      <input id="f-from" type="date">
+    </div>
+    <div class="field">
+      <label for="f-to">To</label>
+      <input id="f-to" type="date">
+    </div>
+    <button class="btn btn-primary" type="submit">Apply</button>
+    <button class="btn" type="button" id="f-clear">Clear</button>
+  </form>
+
+  <div class="table-wrap">
+    <table class="history">
+      <thead>
+        <tr>
+          <th data-sort="createdAt">Date</th>
+          <th>Time</th>
+          <th>Job name</th>
+          <th>Marketplaces</th>
+          <th class="num"># Markets</th>
+          <th class="num">Uploaded rows</th>
+          <th class="num">Unique ASINs</th>
+          <th class="num">Product records</th>
+          <th class="num">Seller offers</th>
+          <th>Status</th>
+          <th>Download</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <div class="pager">
+    <button class="btn" id="prev">← Newer</button>
+    <span id="page-info" class="muted" style="font-size:.85rem;"></span>
+    <button class="btn" id="next">Older →</button>
+  </div>
+</div>
+
+<!-- ─────────────────────────── job details ─────────────────────────── -->
+<div id="detail" class="dialog-backdrop hidden">
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;">
+      <h2 id="detail-title" style="margin:0;font-size:1.15rem;"></h2>
+      <button class="btn" id="detail-close">Close</button>
+    </div>
+    <div class="kv" id="detail-facts" style="margin-top:1rem;"></div>
+    <h3 style="font-size:.95rem;margin:1.25rem 0 .4rem;">Per-marketplace progress</h3>
+    <div class="table-wrap"><table class="history" id="detail-progress"></table></div>
+    <h3 style="font-size:.95rem;margin:1.25rem 0 .4rem;">Data quality</h3>
+    <p class="muted" id="detail-quality" style="font-size:.88rem;margin:0;"></p>
+    <h3 style="font-size:.95rem;margin:1.25rem 0 .4rem;">Uploaded files</h3>
+    <ul id="detail-files" style="font-size:.88rem;margin:0;padding-left:1.1rem;"></ul>
+    <h3 style="font-size:.95rem;margin:1.25rem 0 .4rem;">Reports</h3>
+    <div class="downloads" id="detail-reports"></div>
+    <button class="btn btn-primary" id="detail-regen" style="margin-top:1.25rem;">Generate reports</button>
+  </div>
+</div>
+
+<script src="/history.js"></script>
+</body>
+</html>

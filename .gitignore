@@ -1,0 +1,71 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Playwright
+.playwright/
+playwright-report/
+test-results/
+
+# ─── Secrets and credentials ───────────────────────────────────────────────
+# Every .env variant is ignored, and .env.example is explicitly re-included so
+# the documented settings still reach the repository.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+.netlify/
+
+# ─── Database ──────────────────────────────────────────────────────────────
+# Scraping history and the queue. Never in version control.
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.bak
+# PostgreSQL dump output, if anyone ever takes one in-tree.
+*.dump
+pg_dump*
+pgdata/
+
+# ─── Reports and uploads ───────────────────────────────────────────────────
+# Generated XLSX/TSV reports and customer Excel uploads may contain commercial
+# data. They belong in private object storage, not in git.
+reports/
+report-storage/
+uploads/
+exports/
+*.xlsx.bak
+# Source exports people drop into the project root while testing.
+sample-data/
+*.uploads/
+
+# ─── Session data ──────────────────────────────────────────────────────────
+# Sessions live in PostgreSQL; this only guards against a stray local export.
+sessions/
+*.session
+session.json
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+logs/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+
+# ─── Kept deliberately ─────────────────────────────────────────────────────
+# test/fixtures/ holds saved Amazon HTML used by the accuracy regression tests.
+# They contain no credentials — only public product pages — and the parser tests
+# are worthless without them.

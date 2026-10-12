@@ -1,0 +1,83 @@
+# Netlify configuration template — frontend only.
+#
+# DO NOT DEPLOY THIS FILE DIRECTLY. `netlify.toml` is generated from it by
+# `scripts/prepare-netlify-config.mjs`, which replaces http://127.0.0.1:4310 with the
+# real backend origin.
+#
+# It is a template because Netlify does not substitute `${VAR}` in redirect
+# targets. That was verified against a live project: with the variable set both
+# as a site environment variable and in the process environment, the deployed
+# redirect still held the literal string `${BACKEND_URL}/api/:splat`, resolved
+# against the site, and every `/api/*` call 404'd. Generating the config removes
+# that whole class of silent failure.
+#
+# Generated for: offline mode - no backend configured
+#
+# The scraper is NOT hosted here. Netlify Functions cap execution well below the
+# hours a multi-thousand-ASIN batch needs, and have no Chromium.
+#
+#   Netlify  ->  static frontend, one public URL
+#   Backend  ->  always-on container running the API + Playwright worker
+#
+# Everything is same-origin, so users never see the backend address and the
+# session cookie is same-site.
+
+[build]
+  publish = "public"
+  # No build step: the frontend is vanilla HTML/CSS/JS with no bundler.
+  command = "echo 'Static site - no build required'"
+
+# ---------------------------------------------------------------------------
+# Pages
+# ---------------------------------------------------------------------------
+# Netlify's clean-URL handling already serves /history from history.html, but an
+# explicit rule means it does not depend on that behaviour being enabled.
+
+[[redirects]]
+  from = "/history"
+  to = "/history.html"
+  status = 200
+
+# ---------------------------------------------------------------------------
+# API proxy
+# ---------------------------------------------------------------------------
+# The backend origin is written in by the generator. The browser only ever calls
+# relative /api/... paths, so the address never appears in frontend JavaScript.
+
+[[redirects]]
+  from = "/api/*"
+  to = "/api-offline.json"
+  status = 503
+  force = true
+
+# ---------------------------------------------------------------------------
+# Security headers
+# ---------------------------------------------------------------------------
+# `connect-src 'self'` locks the frontend to its own origin: even if some script
+# tried to call a third-party host, the browser would refuse.
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    Permissions-Policy = "geolocation=(), microphone=(), camera=()"
+
+# The API carries private data: never cached by the CDN, never indexed.
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Cache-Control = "no-store, private"
+    X-Robots-Tag = "noindex, nofollow"
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "DENY"
+
+# Report downloads must not sit in a shared cache either.
+[[headers]]
+  for = "/api/reports/*"
+  [headers.values]
+    Cache-Control = "no-store, private"
+    X-Robots-Tag = "noindex, nofollow"
