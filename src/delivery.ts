@@ -203,6 +203,37 @@ function extractRelativeOffset(text: string): number | null {
  * @returns `null` when the text carries no resolvable date, so callers can
  *   distinguish "no delivery shown" from "delivery shown but unparsed".
  */
+/**
+ * Why a per-seller delivery estimate is absent.
+ *
+ * `null` means dates were parsed. Anything else is an honest, specific reason.
+ * This exists so the report can distinguish "Amazon displayed no estimate for
+ * this seller" from "an estimate was displayed and we failed to read it" — the
+ * second is an extraction bug and must not hide behind a plausible blank.
+ */
+export type DeliveryStatus = 'NOT_SHOWN' | 'UNPARSEABLE' | 'DELIVERY_AT_LOAD' | null;
+
+/** Text Amazon uses when the date is only decided at checkout. */
+const AT_CHECKOUT =
+  /\b(?:at checkout|when you check out|on checkout)\b|عند إتمام الطلب|عند الطلب|توصيل عند الشراء/i;
+
+/**
+ * Classify why no delivery date could be read.
+ *
+ * Ordered by specificity: the most informative explanation wins, so a blank is
+ * never reported as the vaguest possible reason when a sharper one applies.
+ *
+ * @param text Raw delivery text for THIS seller, as Amazon rendered it.
+ */
+export function deliveryStatusFor(text: string | null | undefined): DeliveryStatus {
+  const raw = (text ?? '').trim();
+  if (raw.length === 0) return 'NOT_SHOWN';
+  if (AT_CHECKOUT.test(raw)) return 'DELIVERY_AT_LOAD';
+  // Text is present but contains nothing date-like, so it was unreadable.
+  // Deliberately not folded into NOT_SHOWN: this row has a real extraction gap.
+  return 'UNPARSEABLE';
+}
+
 export function parseDeliveryDates(
   text: string,
   now: Date,

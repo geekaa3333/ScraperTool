@@ -425,3 +425,18 @@ footer p { margin: 0; max-width: 760px; margin-inline: auto; }
 .dash-value { font-weight: 600; font-variant-numeric: tabular-nums; }
 .dashboard-strip.is-low .dash-value { color: #b3261e; }
 .field.checkbox { display: flex; align-items: center; gap: .35rem; }
+
+/* ── Direct Upload slot states ──────────────────────────────────────────
+   Each marketplace slot carries its own state so an unreadable file is obvious
+   without blocking the whole job. A partial selection is a normal thing to do,
+   so an empty slot is neutral rather than an error. */
+.dr-ready { border-left: 3px solid #1a7f37; }
+.dr-invalid { border-left: 3px solid #b3261e; }
+.dr-needs-column { border-left: 3px solid #b06000; }
+
+.dr-count { font-size: .78rem; opacity: .75; }
+.dr-invalid .dr-count { color: #b3261e; opacity: 1; }
+.dr-ready .dr-count { color: #1a7f37; opacity: 1; }
+.dr-needs-column .dr-count { color: #b06000; opacity: 1; }
+
+#directSummary { font-size: .82rem; line-height: 1.5; }

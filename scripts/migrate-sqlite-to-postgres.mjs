@@ -112,7 +112,8 @@ console.log('Source rows:', BEFORE);
 // Target
 // ---------------------------------------------------------------------------
 
-const schema = readFileSync(join(root, 'migrations', '001_init.sql'), 'utf8');
+// Migrations moved into per-engine directories; read the PostgreSQL set.
+const schema = readFileSync(join(root, 'migrations', 'postgres', '001_init.sql'), 'utf8');
 let client;
 if (PG_FILE) {
   const { PGlite } = await import('@electric-sql/pglite');

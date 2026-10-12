@@ -214,6 +214,21 @@ export function getMarketplace(id: string | null | undefined): Marketplace {
   return MARKETPLACES[DEFAULT_MARKETPLACE];
 }
 
+/**
+ * Strict lookup for data rows.
+ *
+ * `getMarketplace` defaults to amazon.eg, which is right for a UI dropdown with
+ * nothing selected and catastrophic for a scraped row: an unrecognised
+ * marketplace id silently became EGP and relabelled every price in that row.
+ * Export, currency resolution and persistence use this instead, so an unknown
+ * marketplace produces null — meaning "not known" — rather than a confident
+ * wrong answer.
+ */
+export function getMarketplaceStrict(id: string | null | undefined): Marketplace | null {
+  if (id && id in MARKETPLACES) return MARKETPLACES[id as MarketplaceId];
+  return null;
+}
+
 /** True when the string is one of the five supported ids. */
 export function isMarketplaceId(value: unknown): value is MarketplaceId {
   return typeof value === 'string' && value in MARKETPLACES;

@@ -16,13 +16,17 @@ import { PGliteClient } from '../dist/pg/client.js';
 import { PostgresStore } from '../dist/pg/store.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const MIGRATION = readFileSync(join(here, '..', 'migrations', '001_init.sql'), 'utf8');
+// Every migration, applied in order — the same set the application applies on
+// boot. Pinning only 001 here would let a later migration's columns go
+// untested until production.
+const applyMigrations = async (client) =>
+  (await import('../dist/migrations.js')).applyMigrations(client);
 
 /** A fresh database with the schema applied. */
 async function freshStore() {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   return { store: new PostgresStore(client), close: () => client.close() };
 }
 
@@ -38,8 +42,10 @@ test('the schema applies cleanly and is idempotent', async () => {
   await store.close();
   const db2 = new PGlite();
   const client2 = new PGliteClient(db2);
-  await client2.exec(MIGRATION);
-  await client2.exec(MIGRATION);
+  // A second, independent database applying the same migrations twice: this is
+  // what a restart and a second process both do in production.
+  await applyMigrations(client2);
+  await applyMigrations(client2);
   await client2.close();
 });
 
@@ -115,7 +121,7 @@ test('changing a password invalidates existing sessions', async () => {
 test('a session resolves to its user and survives a new store instance', async () => {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   const store = new PostgresStore(client);
 
   const user = await store.createUser({ email: 's@example.com', displayName: 'S', password: PASSWORD });
@@ -149,7 +155,7 @@ test('deleting a session logs it out', async () => {
 test('an expired session is refused', async () => {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   const store = new PostgresStore(client);
   const user = await store.createUser({ email: 'e@example.com', displayName: 'E', password: PASSWORD });
   const session = await store.createSession(user.userId);
@@ -177,7 +183,7 @@ test('deleting a user cascades to their sessions', async () => {
 
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   const store2 = new PostgresStore(client);
   await store2.createUser({ email: 'c@example.com', displayName: 'C', password: PASSWORD });
   await client.query('DELETE FROM users WHERE email_normalised = $1', ['c@example.com']);
@@ -204,7 +210,7 @@ test('a reset token works exactly once', async () => {
 test('an expired reset token is refused', async () => {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   const store = new PostgresStore(client);
   const user = await store.createUser({ email: 'rx@example.com', displayName: 'Rx', password: PASSWORD });
   const token = await store.createPasswordReset(user.userId);
@@ -317,7 +323,7 @@ test('claiming takes each item once and leases it', async () => {
 test('an expired lease is reclaimed so a crashed worker does not strand an item', async () => {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   const store = new PostgresStore(client);
   const user = await store.createUser({ email: 'l@example.com', displayName: 'L', password: PASSWORD });
   const jobId = await seedJob(store, user.userId, {

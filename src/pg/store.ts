@@ -9,6 +9,7 @@
  */
 import type { SqlClient } from './client.js';
 import type { CreateJobInput, DataStore } from './store-contract.js';
+import { resolveCurrency } from '../currency.js';
 import {
   CSRF_COOKIE,
   SESSION_COOKIE,
@@ -1075,8 +1076,8 @@ export class PostgresStore implements DataStore {
                                        price_text, price, currency, domain, rating_text,
                                        review_count, availability, image, description, features,
                                        destination, provenance, offers_total_count,
-                                       offers_complete, offers_completeness_note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+                                       offers_complete, offers_completeness_note, currency_status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
        RETURNING snapshot_id`,
       [
         userId, jobId,
@@ -1093,18 +1094,36 @@ export class PostgresStore implements DataStore {
         num(product.offersTotalCount),
         Boolean(product.offersComplete),
         product.offersCompletenessNote ?? null,
+        // Provenance for the currency, so a value inferred from the marketplace
+        // is never later read as one Amazon actually printed.
+        (product.currencyStatus as string) ?? null,
       ],
     );
     const snapshotId = first(rows, 'saveResult').snapshot_id;
 
     for (const offer of offers) {
+      // The offer map is `Record<string, unknown>`, so the delivery fields are
+      // read through a typed view rather than being widened to `{}`.
+      const delivery = (offer.delivery ?? null) as {
+        earliestDate?: string | null;
+        estimatedDate?: string | null;
+        latestDate?: string | null;
+        originalText?: string | null;
+      } | null;
+      const deliveryStart = delivery?.earliestDate ?? delivery?.estimatedDate ?? null;
+      const deliveryEnd = delivery?.latestDate ?? null;
+      const deliveryText = delivery?.originalText ?? null;
+
       await this.db.query(
         `INSERT INTO seller_offers (snapshot_id, user_id, seller_name, seller_id, seller_url,
                                     price_text, price, shipping_text, shipping_fee, shipping_free,
                                     total_price, currency, rating_text, rating, feedback_count,
                                     positive_percent, fulfillment, condition, availability,
-                                    is_buy_box, delivery, price_status, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+                                    is_buy_box, delivery, price_status, notes,
+                                    currency_status, delivery_status, delivery_start_date,
+                                    delivery_end_date, delivery_original_text)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
+                 $24,$25,$26,$27,$28)`,
         [
           snapshotId, userId,
           offer.sellerName ?? null, offer.sellerId ?? null, offer.sellerUrl ?? null,
@@ -1119,6 +1138,14 @@ export class PostgresStore implements DataStore {
           // whether Amazon withheld it or the parser failed.
           offer.priceStatus ?? (offer.price == null ? 'NOT_AVAILABLE_IN_SOURCE' : 'EXTRACTED'),
           offer.notes ?? null,
+          // Provenance: a currency inferred from the marketplace is never read
+          // back as one Amazon printed, and a missing delivery date states why.
+          (offer.currencyStatus as string) ?? null,
+          (offer.deliveryStatus as string | null) ?? null,
+          // The raw text stays authoritative; these are only a reading of it.
+          deliveryStart,
+          deliveryEnd,
+          deliveryText,
         ],
       );
     }
@@ -1137,7 +1164,7 @@ export class PostgresStore implements DataStore {
       `SELECT snapshot_id, asin, marketplace_id, title, brand, price_text, price, currency,
               domain, rating_text, review_count, availability, features, destination,
               provenance, offers_total_count, offers_complete, offers_completeness_note,
-              scraped_at
+              scraped_at, currency_status
          FROM product_snapshots
         WHERE user_id = $1 AND job_id = $2
         ORDER BY marketplace_id, asin`,
@@ -1151,7 +1178,9 @@ export class PostgresStore implements DataStore {
         `SELECT seller_name, seller_id, seller_url, price_text, price, shipping_text,
                 shipping_fee, shipping_free, total_price, currency, rating_text, rating,
                 feedback_count, positive_percent, fulfillment, condition, availability,
-                is_buy_box, delivery, price_status, notes
+                is_buy_box, delivery, price_status, notes,
+                currency_status, delivery_status, delivery_start_date, delivery_end_date,
+                delivery_original_text
            FROM seller_offers WHERE snapshot_id = $1`,
         [snapshot.snapshot_id],
       );
@@ -1173,6 +1202,11 @@ export class PostgresStore implements DataStore {
         description: null,
         domain: snapshot.domain ?? null,
         currency: snapshot.currency ?? null,
+        // Re-resolved when the stored column is absent, so rows captured before
+        // provenance existed still report an honest status.
+        currencyStatus:
+          (snapshot.currency_status as string) ??
+          resolveCurrency(snapshot.marketplace_id as string, snapshot.currency as string).status,
         marketplaceId: snapshot.marketplace_id,
         offers: offerRows.map((offerRow) => {
           const o = offerRow as Record<string, unknown>;
@@ -1195,9 +1229,13 @@ export class PostgresStore implements DataStore {
             condition: o.condition ?? null,
             availability: o.availability ?? null,
             isBuyBox: Boolean(o.is_buy_box),
-            delivery: safeJson(o.delivery, null),
             priceStatus: o.price_status ?? null,
             notes: o.notes ?? null,
+            currencyStatus: o.currency_status ?? null,
+            // Rebuilt with the reason it is missing, so the report can tell
+            // "Amazon showed none" from "we could not read one".
+            deliveryStatus: o.delivery_status ?? null,
+            delivery: buildDelivery(o),
           };
         }),
         offersComplete: Boolean(snapshot.offers_complete),
@@ -1267,6 +1305,39 @@ export class PostgresStore implements DataStore {
   async close(): Promise<void> {
     await this.db.close();
   }
+}
+
+
+/**
+ * Rebuild a per-seller delivery estimate from a stored offer row.
+ *
+ * Prefers the JSON blob the original scraper wrote, then fills gaps from the
+ * flat provenance columns. Returns null when the seller had no delivery block
+ * at all — distinct from having one that could not be parsed, which
+ * `deliveryStatus` carries.
+ */
+function buildDelivery(o: Record<string, unknown>): Record<string, unknown> | null {
+  const stored = safeJson<Record<string, unknown> | null>(o.delivery, null);
+  const text = (o.delivery_original_text as string) ?? (stored?.originalText as string) ?? null;
+  const start = (o.delivery_start_date as string) ?? (stored?.earliestDate as string) ?? null;
+  const end = (o.delivery_end_date as string) ?? (stored?.latestDate as string) ?? null;
+  const status = (o.delivery_status as string) ?? (stored?.unavailableReason as string) ?? null;
+
+  if (!stored && !text && !start && status === null) return null;
+
+  return {
+    sellerName: (stored?.sellerName as string) ?? null,
+    originalText: text,
+    estimatedDate: (stored?.estimatedDate as string) ?? start,
+    earliestDate: start,
+    latestDate: end,
+    estimatedDays: (stored?.estimatedDays as number) ?? null,
+    shippingText: (stored?.shippingText as string) ?? null,
+    shippingFee: num(stored?.shippingFee),
+    destination: (stored?.destination as string) ?? null,
+    destinationPostalCode: (stored?.destinationPostalCode as string) ?? null,
+    unavailableReason: status,
+  };
 }
 
 /** Unique ASIN count per marketplace, computed from the items themselves. */

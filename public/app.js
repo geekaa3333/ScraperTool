@@ -529,8 +529,20 @@ init().then(initBulk);
  * ever inspects an ASIN, a Region cell or a filename to decide a marketplace.
  */
 const direct = {
-  enabled: new Set(['eg']),
+  // Every marketplace starts ENABLED, so all six upload slots are immediately
+  // usable.
+  //
+  // Previously only amazon.eg was enabled, which meant the other five rendered
+  // as inert rows labelled "Enable to upload a file for this marketplace". A user
+  // uploading EG + AE had to discover and tick a checkbox for AE first, and the
+  // panel read as though all six files were required. Any subset is valid, so
+  // every slot should look available and optional.
+  enabled: new Set(),
   files: new Map(), // marketplaceId -> File
+  // Per-slot preview results from /api/queue/preview: ASIN counts and validity
+  // for the files actually attached, so Start can be enabled on real
+  // information rather than on "a file was picked".
+  preview: new Map(),
 };
 
 const bulk = {
@@ -583,7 +595,17 @@ async function initBulk() {
     )
     .join('');
 
+  // All six slots usable from the start; ANY subset of them is a valid job.
+  // Without this only amazon.eg had a file input, and the other five rendered
+  // as inert rows — which made the panel read as though all six files were
+  // required and left a user uploading EG + AE unable to attach AE at all.
+  for (const mp of state.marketplaces) direct.enabled.add(mp.id);
+
   buildDirectRows();
+  // Called on init because the Start button's enabled state is derived here.
+  // Without it the button is clickable with zero files attached, and the user
+  // learns that from an "Empty upload" error instead of a disabled control.
+  updateDirectSummary();
   $b('directStart').addEventListener('click', startDirectUpload);
 
   $b('bulkFilterMarket').innerHTML =
@@ -731,7 +753,11 @@ function buildDirectRows() {
           direct.files.delete(id);
           $(`drc-${id}`).textContent = '';
         }
+        // Picking another file for the same slot replaces it, so a mistaken
+        // pick is recoverable without clearing the whole job.
+        direct.preview.delete(id);
         updateDirectSummary();
+        refreshDirectPreview();
       }),
     );
 
@@ -741,19 +767,121 @@ function buildDirectRows() {
       button.addEventListener('click', () => {
         const id = button.dataset.mp;
         direct.files.delete(id);
+        direct.preview.delete(id);
         buildDirectRows();
         updateDirectSummary();
+        refreshDirectPreview();
       }),
     );
 }
 
-/** Live count of marketplaces enabled and files attached. */
+/**
+ * Live summary of the Direct Upload panel.
+ *
+ * Counts what will actually be scraped, not what is merely enabled. Start is
+ * enabled when at least one file is attached and readable — a single file is a
+ * complete job, so an empty slot is never a reason to block.
+ *
+ * While the server preview is still in flight the button stays disabled, so the
+ * user cannot start a job whose files have not been validated yet.
+ */
 function updateDirectSummary() {
   const attached = direct.files.size;
-  $b('directSummary').textContent =
-    `${direct.enabled.size} marketplace(s) enabled · ${attached} file(s) attached` +
-    (attached === 0 ? ' — attach at least one file to start.' : ' · ready to start.');
-  $b('directStart').disabled = attached === 0;
+  const slots = [...direct.preview.values()];
+  const valid = slots.filter((s) => s.valid).length;
+  const invalid = slots.filter((s) => !s.valid && s.error).length;
+  const previewing = direct.preview.size < attached;
+
+  if (attached === 0) {
+    $b('directSummary').textContent =
+      `Any combination of marketplaces is accepted — attach a file to one or more of the ` +
+      `${direct.enabled.size} slots. Unused slots are ignored.`;
+  } else if (previewing) {
+    $b('directSummary').textContent = `${attached} file(s) attached — checking…`;
+  } else {
+    const asins = slots.reduce((sum, s) => sum + (s.uniqueAsins || 0), 0);
+    const parts = [
+      `${attached} marketplace(s) selected`,
+      `${asins.toLocaleString()} unique ASIN(s)`,
+      invalid ? `${invalid} unreadable file(s)` : null,
+      valid >= attached ? 'ready to start' : 'fix the highlighted file(s)',
+    ].filter(Boolean);
+    $b('directSummary').textContent = parts.join(' · ');
+  }
+
+  // Disabled with nothing attached, while validating, or when every attached
+  // file failed to read.
+  $b('directStart').disabled = attached === 0 || previewing || valid === 0;
+}
+
+/**
+ * Ask the server to validate and count the attached workbooks.
+ *
+ * Parsing happens server-side because the browser has no Excel reader and
+ * because the count must come from the same parser the job will use — a
+ * client-side estimate could disagree with what actually gets scraped.
+ *
+ * Debounced so choosing files one at a time sends one request, not one per
+ * click.
+ */
+let directPreviewTimer = null;
+function refreshDirectPreview() {
+  if (directPreviewTimer) clearTimeout(directPreviewTimer);
+  if (direct.files.size === 0) {
+    direct.preview.clear();
+    updateDirectSummary();
+    return;
+  }
+
+  directPreviewTimer = setTimeout(async () => {
+    const form = new FormData();
+    for (const [marketplaceId, file] of direct.files) form.append(marketplaceId, file);
+
+    let result = null;
+    try {
+      const response = await fetch('/api/queue/preview', { method: 'POST', body: form });
+      result = await response.json();
+    } catch {
+      result = null;
+    }
+
+    direct.preview.clear();
+    if (result && Array.isArray(result.slots)) {
+      for (const slot of result.slots) direct.preview.set(slot.marketplaceId, slot);
+    }
+    renderDirectPreview();
+    updateDirectSummary();
+  }, 250);
+}
+
+/** Paint per-slot state: ready, invalid, or awaiting a column choice. */
+function renderDirectPreview() {
+  for (const [id, slot] of direct.preview) {
+    const countEl = $(`drc-${id}`);
+    if (!countEl) continue;
+
+    const row = document.getElementById(`dr-${id}`);
+    if (row) row.classList.remove('dr-invalid', 'dr-ready', 'dr-needs-column');
+
+    if (slot.error) {
+      countEl.textContent = `${slot.filename}: ${slot.error}`;
+      countEl.title = slot.error;
+      row?.classList.add('dr-invalid');
+    } else if (slot.needsColumn) {
+      countEl.textContent = `${slot.filename}: choose the ASIN column`;
+      countEl.title = 'The ASIN column could not be identified.';
+      row?.classList.add('dr-needs-column');
+    } else if (slot.valid) {
+      const dupes = slot.duplicates ? `, ${slot.duplicates} duplicate` : '';
+      const bad = slot.invalid ? `, ${slot.invalid} invalid` : '';
+      countEl.textContent = `${slot.filename}: ${slot.uniqueAsins} ASIN(s)${dupes}${bad}`;
+      countEl.title = `${slot.rows} row(s), ${slot.uniqueAsins} unique`;
+      row?.classList.add('dr-ready');
+    } else {
+      countEl.textContent = `${slot.filename}: no usable ASINs`;
+      row?.classList.add('dr-invalid');
+    }
+  }
 }
 
 /**

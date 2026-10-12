@@ -15,11 +15,13 @@ import {
   type MarketplaceId,
 } from './marketplaces.js';
 import {
+  deliveryStatusFor,
   estimateDays,
   isFreeShipping,
   parseDeliveryDates,
   parseShippingFee,
 } from './delivery.js';
+import { detectCurrencyInText, resolveCurrency } from './currency.js';
 
 /**
  * Seller-offer extraction from Amazon's "all offers" listing.
@@ -526,6 +528,16 @@ function parseDeliveryForGroup(
   const shippingText = extractShippingText(originalText);
   const fee = parseShippingFee(shippingText ?? originalText);
 
+  // This seller DID show delivery text, so a missing date is a parsing gap
+  // rather than an absence of information. Recording that is what stops a real
+  // extraction bug from hiding behind an innocent-looking blank cell.
+  const unavailableReason =
+    estimated !== null
+      ? null
+      : deliveryStatusFor(originalText) === 'DELIVERY_AT_LOAD'
+        ? 'DELIVERY_AT_LOAD'
+        : 'UNPARSEABLE';
+
   return {
     sellerName,
     originalText,
@@ -537,6 +549,7 @@ function parseDeliveryForGroup(
     shippingFee: fee,
     destination: options.destination?.amazonLabel ?? options.destination?.label ?? null,
     destinationPostalCode: options.destination?.postalCode ?? null,
+    unavailableReason,
   };
 }
 
@@ -705,6 +718,16 @@ export function parseOffers(
 
     const totalPrice = price !== null && shippingFee !== null ? price + shippingFee : null;
 
+    // What the page ACTUALLY showed in this offer's price text, which can differ
+    // from the marketplace's own currency. Read per offer: a mismatch on one
+    // seller must not relabel the other sellers in the same listing.
+    const observedCurrency = detectCurrencyInText(priceText) ?? detectCurrencyInText(shippingText);
+
+    // Resolved once per offer so the code and its provenance cannot drift apart.
+    // Observed currency wins over the marketplace's; an unknown marketplace falls
+    // through to null rather than inheriting a global default.
+    const currencyResolution = resolveCurrency(marketplace.id, observedCurrency, marketplace);
+
     offers.push({
       id: sellerId ?? `offer-${offers.length + 1}`,
       sellerName,
@@ -716,7 +739,11 @@ export function parseOffers(
       shippingFee,
       shippingFree,
       totalPrice,
-      currency,
+      // Resolved for THIS offer from the currency Amazon rendered, falling back
+      // to the marketplace — never to a global default. See currency.ts.
+      currency: currencyResolution.code,
+      currencyStatus: currencyResolution.status,
+      deliveryStatus: delivery === null ? 'NOT_SHOWN' : delivery.unavailableReason,
       ratingText: (() => {
         const alt = clean(group.find('.a-icon-alt').first().text());
         return alt && /5|نجوم|stars/i.test(alt) ? alt : null;

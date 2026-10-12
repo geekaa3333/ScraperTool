@@ -29,7 +29,11 @@ import {
 import { rowsForProduct } from '../dist/exports.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const MIGRATION = readFileSync(join(here, '..', 'migrations', '001_init.sql'), 'utf8');
+// Every migration, applied in order — the same set the application applies on
+// boot. Pinning only 001 here would let a later migration's columns go
+// untested until production.
+const applyMigrations = async (client) =>
+  (await import('../dist/migrations.js')).applyMigrations(client);
 
 const PASSWORD = 'a very long password';
 
@@ -108,7 +112,7 @@ const PRODUCT = {
 async function freshStore() {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   return { store: new PostgresStore(client), close: () => client.close() };
 }
 
@@ -314,7 +318,7 @@ test('XLSX and TSV from the same job agree on their data', async () => {
 test('a report stays downloadable after the server is replaced', async () => {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   const storage = tempStorage();
 
   const before = new PostgresStore(client);
@@ -389,7 +393,7 @@ test('retention keeps everything by default and deletes only when configured', a
 async function boot() {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   const store = new PostgresStore(client);
   const storage = tempStorage();
   const layer = new AuthLayer(store, { secureCookies: true, storage });

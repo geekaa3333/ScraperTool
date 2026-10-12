@@ -45,6 +45,20 @@ async function main(): Promise<void> {
   const { store } = runtime;
   console.log(`[boot] database: ${runtime.kind} (${runtime.describe})`);
 
+  // A worker started before the API must not sit waiting on tables that do not
+  // exist yet. Idempotent, so restarts are harmless.
+  if (runtime.kind === 'postgres') {
+    const { applyMigrations } = await import('./migrations.js');
+    const { createDatabaseClient } = await import('./pg/client.js');
+    const client = await createDatabaseClient(process.env.DATABASE_URL ?? '');
+    try {
+      const applied = await applyMigrations(client);
+      console.log(`[boot] migrations applied: ${applied.join(', ')}`);
+    } finally {
+      await client.close();
+    }
+  }
+
   const storage = createReportStorage();
   const scraper = new ScrapeWorker();
 

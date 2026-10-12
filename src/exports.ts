@@ -1,6 +1,7 @@
 import ExcelJS from 'exceljs';
 import type { ProductWithOffers, SellerOffer } from './types.js';
-import { getMarketplace, type MarketplaceId } from './marketplaces.js';
+import { getMarketplace, getMarketplaceStrict, type MarketplaceId } from './marketplaces.js';
+import { resolveCurrency } from './currency.js';
 
 /**
  * Export generation for bulk results.
@@ -26,9 +27,16 @@ export type RowStatus = 'OK' | 'NO_OFFERS' | 'FAILED' | 'INCOMPLETE' | 'NOT_FOUN
 export interface ExportRow {
   // --- marketplace provenance (new) ---
   marketplaceId: string;
-  marketplaceDomain: string;
-  country: string;
-  regionCode: string;
+  /**
+   * Nullable on purpose.
+   *
+   * An unrecognised marketplace leaves these blank rather than being filled
+   * from a default. A blank says "not known"; EGP in a UAE row says something
+   * false, and this column exists so that can never happen.
+   */
+  marketplaceDomain: string | null;
+  country: string | null;
+  regionCode: string | null;
   detectionMethod: string;
   detectionStatus: string;
   /**
@@ -69,8 +77,20 @@ export interface ExportRow {
   deliveryDays: number | null;
   deliveryDestination: string | null;
   deliveryText: string | null;
+  /**
+   * Why this seller's delivery estimate is blank.
+   *
+   * 'NOT_SHOWN'   Amazon displayed no estimate for THIS seller.
+   * 'UNPARSEABLE' Text was displayed but no date could be read — a real gap.
+   *
+   * Without this, a parsing failure is indistinguishable from an honest blank,
+   * and extraction bugs hide behind plausible empty cells.
+   */
+  deliveryStatus: string | null;
   // --- meta ---
   currency: string | null;
+  /** How `currency` was established. An inference is not a fact. */
+  currencyStatus: string | null;
   offersCount: number;
   offersComplete: boolean;
   status: RowStatus;
@@ -131,6 +151,8 @@ export const EXPORT_COLUMNS: Column[] = [
   { key: 'deliveryDays', header: 'Delivery Days', width: 14, numeric: true },
   { key: 'deliveryDestination', header: 'Delivery Destination', width: 20 },
   { key: 'deliveryText', header: 'Delivery Text (original)', width: 52 },
+  { key: 'deliveryStatus', header: 'Delivery Status', width: 17 },
+  { key: 'currencyStatus', header: 'Currency Verified By', width: 22 },
 
   { key: 'sourceRow', header: 'Source Excel Row', width: 15, numeric: true },
   { key: 'sourceFile', header: 'Source File', width: 22 },
@@ -169,13 +191,19 @@ function textOrBlank(value: string | null): string {
 
 /** Build the export rows for one scraped product. */
 export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
-  const marketplace = getMarketplace(product.marketplaceId);
+  // STRICT lookup, deliberately. `getMarketplace` falls back to amazon.eg, which
+  // would relabel an unrecognised marketplace's prices as EGP — the exact bug
+  // this replaced. An unknown marketplace leaves the currency blank and marked
+  // unverified instead of asserting a wrong one.
+  const marketplace = getMarketplaceStrict(product.marketplaceId);
 
   const base = {
-    marketplaceId: marketplace.id,
-    marketplaceDomain: marketplace.domain,
-    country: marketplace.country,
-    regionCode: marketplace.countryCode,
+    // Left as the raw id rather than a substituted default, so an unknown
+    // marketplace stays visible as its own value instead of masquerading as EG.
+    marketplaceId: product.marketplaceId,
+    marketplaceDomain: marketplace?.domain ?? null,
+    country: marketplace?.country ?? null,
+    regionCode: marketplace?.countryCode ?? null,
     // Verbatim, exactly as Amazon rendered it — never translated.
     asin: product.asin,
     productTitle: product.title,
@@ -185,7 +213,10 @@ export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
     productRating: product.rating,
     reviewCount: product.reviewCount,
     productAvailability: product.availability,
-    currency: product.currency ?? marketplace.currency,
+    // Per-row, resolved by `resolveCurrency`: never a global default. An
+    // unknown marketplace yields null rather than silently becoming EGP.
+    currency: resolveCurrency(product.marketplaceId, product.currency, marketplace).code,
+    currencyStatus: resolveCurrency(product.marketplaceId, product.currency, marketplace).status,
     offersCount: product.offers.length,
     offersComplete: product.offersComplete,
     scrapedAt: product.scrapedAt,
@@ -198,6 +229,8 @@ export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
     originalMarketplaceInput: product.provenance?.originalInput ?? null,
     sourceRow: product.provenance?.sourceRow ?? null,
     sourceFile: product.provenance?.sourceFile ?? null,
+    // Set per offer; declared here so the shared base type is complete.
+    deliveryStatus: null,
   };
 
   // A product with no offers still gets a row, so the ASIN is never silently
@@ -223,6 +256,7 @@ export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
         deliveryDays: null,
         deliveryDestination: product.destination?.label ?? null,
         deliveryText: null,
+        deliveryStatus: 'NO_OFFERS',
         status: 'NO_OFFERS' as RowStatus,
         statusDetail:
           product.offersCompletenessNote ??
@@ -295,6 +329,9 @@ function rowForOffer(
     deliveryDays: delivery?.estimatedDays ?? null,
     deliveryDestination: delivery?.destination ?? product.destination?.label ?? null,
     deliveryText: delivery?.originalText ?? null,
+    // Falls back to the offer's own recorded status, so a row with no delivery
+    // block says so rather than staying blank for no stated reason.
+    deliveryStatus: offer.deliveryStatus ?? delivery?.unavailableReason ?? null,
     status,
     statusDetail: product.offersComplete ? null : product.offersCompletenessNote,
   };
@@ -361,7 +398,9 @@ export function failedRow(
     deliveryDays: null,
     deliveryDestination: null,
     deliveryText: null,
+    deliveryStatus: null,
     currency: marketplace.currency,
+    currencyStatus: null,
     offersCount: 0,
     offersComplete: false,
     status,

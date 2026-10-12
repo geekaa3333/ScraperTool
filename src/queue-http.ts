@@ -25,6 +25,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import ExcelJS from 'exceljs';
 import {
+  UploadError,
   parseMultipartFiles,
   readBodyLimited,
   validateWorkbookUpload,
@@ -115,6 +116,17 @@ export class QueueApi {
 
     if (path === '/api/queue/direct' && req.method === 'POST') {
       await this.directUpload(req, res, url, caller);
+      return true;
+    }
+
+    // Validate and count attached files WITHOUT queueing anything.
+    //
+    // This is what lets the UI show per-marketplace ASIN counts and flag an
+    // unreadable file before the user commits to a job. It exists because
+    // "did my upload work?" used to be answerable only by starting the job and
+    // reading the error afterwards.
+    if (path === '/api/queue/preview' && req.method === 'POST') {
+      await this.previewUpload(req, res);
       return true;
     }
 
@@ -221,7 +233,20 @@ export class QueueApi {
       }
       const marketplaceId = field as MarketplaceId;
 
-      const rows = await readWorkbookRows(part);
+      // An unreadable file rejects the whole job, and that is deliberate: if it
+      // were skipped silently the user would believe they were scraping that
+      // marketplace when nothing was. The message names the slot, because with
+      // six independent inputs "that file" is not actionable on its own.
+      try {
+        var rows = await readWorkbookRows(part);
+      } catch (error) {
+        const marketplace = getMarketplace(marketplaceId);
+        throw new UploadError(
+          `${marketplace.label} (${marketplace.domain}): ` +
+            `${String((error as Error)?.message ?? error).replace(/\s+for this upload.*$/, '')} ` +
+            `— file "${part.filename ?? 'unnamed'}".`,
+        );
+      }
       if (rows.length === 0) continue;
 
       const result = parseDirectFile(rows, marketplaceId, part.filename, overrides.get(field) ?? null);
@@ -344,6 +369,95 @@ export class QueueApi {
       blank: blankTotal,
       duplicates: duplicateTotal,
       message: 'Queued. The worker picks this up automatically — you can close this page.',
+    });
+  }
+
+  /**
+   * Parse attached workbooks and report what each one contains.
+   *
+   * Never creates a job and never touches Amazon. Each entry is reported
+   * independently so one unreadable file cannot hide the five that are fine —
+   * the whole point is that a partial selection is a normal thing to do.
+   */
+  private async previewUpload(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readBodyLimited(req, (this.options.maxUploadBytes ?? 50 * 1024 * 1024) * 5);
+    const parts = parseMultipartFiles(body, req.headers['content-type']);
+
+    const slots: Array<{
+      marketplaceId: string;
+      label: string;
+      filename: string | null;
+      rows: number;
+      uniqueAsins: number;
+      duplicates: number;
+      blank: number;
+      invalid: number;
+      valid: boolean;
+      error: string | null;
+      needsColumn: boolean;
+    }> = [];
+
+    const unknown: string[] = [];
+
+    for (const part of parts) {
+      const field = part.fieldName ?? '';
+      if (!isMarketplaceId(field)) {
+        unknown.push(field || '(unnamed slot)');
+        continue;
+      }
+      const marketplaceId = field as MarketplaceId;
+      const marketplace = getMarketplace(marketplaceId);
+
+      const base = {
+        marketplaceId,
+        label: `${marketplace.label} (${marketplace.domain})`,
+        filename: part.filename ?? null,
+        rows: 0,
+        uniqueAsins: 0,
+        duplicates: 0,
+        blank: 0,
+        invalid: 0,
+        valid: false,
+        error: null as string | null,
+        needsColumn: false,
+      };
+
+      try {
+        const rows = await readWorkbookRows(part);
+        if (rows.length === 0) {
+          slots.push({ ...base, error: 'The workbook has no rows.' });
+          continue;
+        }
+        const parsed = parseDirectFile(rows, marketplaceId, part.filename ?? 'upload.xlsx', null);
+        if (parsed.needsColumn) {
+          // Not an error — the file is fine, the column just could not be
+          // identified, and the UI already offers a column picker.
+          slots.push({ ...base, needsColumn: true, rows: parsed.rows.length, valid: parsed.rows.length > 0 });
+          continue;
+        }
+        const unique = new Set(parsed.rows.map((r) => r.asin));
+        slots.push({
+          ...base,
+          rows: parsed.rows.length,
+          uniqueAsins: unique.size,
+          duplicates: parsed.duplicates,
+          blank: parsed.blankCount,
+          invalid: parsed.rejections.filter((r) => r.reason === 'invalid-asin').length,
+          valid: unique.size > 0,
+        });
+      } catch (error) {
+        // Reported per slot so the other five marketplaces still show counts.
+        slots.push({ ...base, error: String((error as Error)?.message ?? error).slice(0, 300) });
+      }
+    }
+
+    sendJson(res, 200, {
+      slots,
+      unknownSlots: unknown,
+      selected: slots.filter((s) => s.valid).length,
+      totalUniqueAsins: slots.reduce((sum, s) => sum + s.uniqueAsins, 0),
+      // False when nothing usable was attached, which is what disables Start.
+      ready: slots.some((s) => s.valid),
     });
   }
 

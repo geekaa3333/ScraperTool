@@ -18,7 +18,11 @@ import { DurableJobWorker } from '../dist/job-worker.js';
 import { LocalReportStorage } from '../dist/storage/index.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const MIGRATION = readFileSync(join(here, '..', 'migrations', '001_init.sql'), 'utf8');
+// Every migration, applied in order — the same set the application applies on
+// boot. Pinning only 001 here would let a later migration's columns go
+// untested until production.
+const applyMigrations = async (client) =>
+  (await import('../dist/migrations.js')).applyMigrations(client);
 
 /** A scraper double that records every ASIN it is asked for. */
 function fakeScraper(overrides = {}) {
@@ -88,7 +92,7 @@ function fakeScraper(overrides = {}) {
 async function boot() {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   const store = new PostgresStore(client);
   return { store, client, db };
 }

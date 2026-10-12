@@ -66,6 +66,7 @@ import type {
   StoredPasswordRow,
 } from './store-contract.js';
 import type { JobListFilter, JobSummary, SessionUser } from './store.js';
+import { resolveCurrency } from '../currency.js';
 
 export { CSRF_COOKIE, SESSION_COOKIE };
 
@@ -107,6 +108,39 @@ function safeJson<T>(value: unknown, fallback: T): T {
 
 function json(value: unknown): string | null {
   return value === null || value === undefined ? null : JSON.stringify(value);
+}
+
+
+/**
+ * Rebuild a per-seller delivery estimate from a stored offer row.
+ *
+ * Prefers the JSON blob written by the original scraper, then fills the gaps
+ * from the flat provenance columns added later. Returns null when the seller had
+ * no delivery block at all, which is different from having one that could not be
+ * parsed — `deliveryStatus` carries that distinction.
+ */
+function buildDelivery(o: Record<string, unknown>): Record<string, unknown> | null {
+  const stored = safeJson<Record<string, unknown> | null>(o.delivery, null);
+  const text = (o.delivery_original_text as string) ?? (stored?.originalText as string) ?? null;
+  const start = (o.delivery_start_date as string) ?? (stored?.earliestDate as string) ?? null;
+  const end = (o.delivery_end_date as string) ?? (stored?.latestDate as string) ?? null;
+  const status = (o.delivery_status as string) ?? (stored?.unavailableReason as string) ?? null;
+
+  if (!stored && !text && !start && status === null) return null;
+
+  return {
+    sellerName: (stored?.sellerName as string) ?? null,
+    originalText: text,
+    estimatedDate: (stored?.estimatedDate as string) ?? start,
+    earliestDate: start,
+    latestDate: end,
+    estimatedDays: (stored?.estimatedDays as number) ?? null,
+    shippingText: (stored?.shippingText as string) ?? null,
+    shippingFee: num(stored?.shippingFee),
+    destination: (stored?.destination as string) ?? null,
+    destinationPostalCode: (stored?.destinationPostalCode as string) ?? null,
+    unavailableReason: status,
+  };
 }
 
 /** Unique ASIN count per marketplace, computed from the items themselves. */
@@ -171,8 +205,47 @@ export class SqliteStore implements DataStore {
    */
   private applySchema(): void {
     const here = dirname(fileURLToPath(import.meta.url));
-    const sql = readFileSync(join(here, '..', '..', 'migrations', '002_local_sqlite.sql'), 'utf8');
+    const sql = readFileSync(join(here, '..', '..', 'migrations', 'sqlite', '001_local.sqlite.sql'), 'utf8');
     this.db.exec(sql);
+    this.applyAdditiveColumns();
+  }
+
+  /**
+   * Later migrations, applied idempotently.
+   *
+   * SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so each column is
+   * checked with PRAGMA table_info before being added. This is what lets the
+   * schema run on every boot without erroring on an already-migrated database —
+   * the behaviour `migrations/002_local_sqlite.sql` gets for free from
+   * `CREATE TABLE IF NOT EXISTS`, and the reason it has to be written out here
+   * for ALTER instead.
+   *
+   * Nullable with no default, so historical rows read NULL — meaning "never
+   * collected". No value is invented for data this application did not observe.
+   */
+  private applyAdditiveColumns(): void {
+    const columns: Array<[string, string, string]> = [
+      ['seller_offers', 'currency_status', 'TEXT'],
+      ['seller_offers', 'delivery_status', 'TEXT'],
+      ['seller_offers', 'delivery_start_date', 'TEXT'],
+      ['seller_offers', 'delivery_end_date', 'TEXT'],
+      ['seller_offers', 'delivery_original_text', 'TEXT'],
+      ['seller_offers', 'positive_percent_source', 'TEXT'],
+      ['product_snapshots', 'currency_status', 'TEXT'],
+    ];
+
+    for (const [table, column, type] of columns) {
+      const existing = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (existing.some((c) => c.name === column)) continue;
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
+
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS seller_offers_delivery_status_idx ON seller_offers (snapshot_id, delivery_status)',
+    );
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS seller_offers_currency_status_idx ON seller_offers (snapshot_id, currency_status)',
+    );
   }
 
   /**
@@ -1131,8 +1204,8 @@ export class SqliteStore implements DataStore {
                                            rating_text, review_count, availability, image,
                                            description, features, destination, provenance,
                                            offers_total_count, offers_complete,
-                                           offers_completeness_note, scraped_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                           offers_completeness_note, scraped_at, currency_status)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT (job_id, marketplace_id, asin) DO UPDATE SET
              title = excluded.title,
              brand = excluded.brand,
@@ -1151,7 +1224,8 @@ export class SqliteStore implements DataStore {
              offers_total_count = excluded.offers_total_count,
              offers_complete = excluded.offers_complete,
              offers_completeness_note = excluded.offers_completeness_note,
-             scraped_at = excluded.scraped_at`,
+             scraped_at = excluded.scraped_at,
+             currency_status = excluded.currency_status`,
         )
         .run(
           snapshotId,
@@ -1177,6 +1251,7 @@ export class SqliteStore implements DataStore {
           boolInt(product.offersComplete),
           (product.offersCompletenessNote as string) ?? null,
           scrapedAt,
+          (product.currencyStatus as string) ?? null,
         );
 
       // ON CONFLICT DO UPDATE assigns to `excluded.snapshot_id`, so the id is
@@ -1196,10 +1271,13 @@ export class SqliteStore implements DataStore {
                                     seller_url, price_text, price, shipping_text, shipping_fee,
                                     shipping_free, total_price, currency, rating_text, rating,
                                     feedback_count, positive_percent, fulfillment, condition,
-                                    availability, is_buy_box, delivery, price_status, notes)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+                                    availability, is_buy_box, delivery, price_status, notes,
+                                    currency_status, delivery_status, delivery_start_date,
+                                    delivery_end_date, delivery_original_text)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       );
-      offers.forEach((offer, index) => {
+      offers.forEach((offer) => {
+        const delivery = (offer.delivery ?? null) as Record<string, unknown> | null;
         insertOffer.run(
           randomUUID(),
           snapshotIdNow,
@@ -1227,6 +1305,15 @@ export class SqliteStore implements DataStore {
           // whether Amazon withheld it or the parser failed.
           (offer.priceStatus as string) ?? (offer.price == null ? 'NOT_AVAILABLE_IN_SOURCE' : 'EXTRACTED'),
           (offer.notes as string) ?? null,
+          // Provenance, so a currency inferred from the marketplace is never
+          // read back as a fact Amazon printed.
+          (offer.currencyStatus as string) ?? null,
+          (offer.deliveryStatus as string | null) ?? null,
+          (delivery?.earliestDate ?? delivery?.estimatedDate ?? null) as string | null,
+          (delivery?.latestDate ?? null) as string | null,
+          // The raw text is authoritative: structured dates are a reading of it,
+          // never a replacement for it.
+          (delivery?.originalText ?? null) as string | null,
         );
       });
     });
@@ -1246,7 +1333,7 @@ export class SqliteStore implements DataStore {
         `SELECT snapshot_id, asin, marketplace_id, title, brand, price_text, price, currency,
                 domain, rating_text, review_count, availability, features, destination,
                 provenance, offers_total_count, offers_complete, offers_completeness_note,
-                scraped_at
+                scraped_at, currency_status
            FROM product_snapshots
           WHERE user_id = ? AND job_id = ?
           ORDER BY marketplace_id, asin`,
@@ -1261,7 +1348,9 @@ export class SqliteStore implements DataStore {
       `SELECT seller_name, seller_id, seller_url, price_text, price, shipping_text,
               shipping_fee, shipping_free, total_price, currency, rating_text, rating,
               feedback_count, positive_percent, fulfillment, condition, availability,
-              is_buy_box, delivery, price_status, notes
+              is_buy_box, delivery, price_status, notes,
+              currency_status, delivery_status, delivery_start_date, delivery_end_date,
+              delivery_original_text
          FROM seller_offers WHERE snapshot_id = ?`,
     );
 
@@ -1284,6 +1373,14 @@ export class SqliteStore implements DataStore {
         description: null,
         domain: snapshot.domain ?? null,
         currency: snapshot.currency ?? null,
+        // Re-resolved on read so a snapshot stored before this column existed
+        // still reports an honest status rather than a silent NULL.
+        currencyStatus:
+          (snapshot.currency_status as string) ??
+          resolveCurrency(
+            snapshot.marketplace_id as string,
+            snapshot.currency as string,
+          ).status,
         marketplaceId: snapshot.marketplace_id,
         offers: offerRows.map((o) => ({
           sellerName: o.seller_name ?? null,
@@ -1304,9 +1401,14 @@ export class SqliteStore implements DataStore {
           condition: o.condition ?? null,
           availability: o.availability ?? null,
           isBuyBox: Boolean(o.is_buy_box),
-          delivery: safeJson(o.delivery, null),
           priceStatus: o.price_status ?? null,
           notes: o.notes ?? null,
+          currencyStatus: o.currency_status ?? null,
+          // Per-seller delivery, rebuilt with the reason it is missing so the
+          // report can distinguish "Amazon showed none" from "we could not read
+          // one". A Buy Box date is never substituted for a missing estimate.
+          deliveryStatus: o.delivery_status ?? null,
+          delivery: buildDelivery(o),
         })),
         offersComplete: Boolean(snapshot.offers_complete),
         offersCompletenessNote: snapshot.offers_completeness_note ?? null,

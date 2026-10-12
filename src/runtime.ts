@@ -76,14 +76,13 @@ export async function createRuntime(options: { dbPath: string; databaseUrl?: str
   const client = await createDatabaseClient(databaseUrl);
   const store = new PostgresStore(client);
 
+  // PGlite has no server and no bootstrap, so the schema is applied here. Every
+  // migration runs, not just the first: a later migration can add a column the
+  // application now writes, and applying only 001 leaves the store issuing
+  // statements against columns that do not exist.
   if (kind === 'pglite') {
-    // PGlite has no server and no bootstrap, so apply the schema here. It is
-    // the same file the hosted path uses, so tests exercise the real schema.
-    const { readFileSync } = await import('node:fs');
-    const { fileURLToPath } = await import('node:url');
-    const { dirname, join } = await import('node:path');
-    const here = dirname(fileURLToPath(import.meta.url));
-    await client.exec(readFileSync(join(here, '..', 'migrations', '001_init.sql'), 'utf8'));
+    const { applyMigrations } = await import('./migrations.js');
+    await applyMigrations(client);
   }
 
   return {

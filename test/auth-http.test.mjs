@@ -30,7 +30,10 @@ import {
 } from '../dist/auth.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const MIGRATION = readFileSync(join(here, '..', 'migrations', '001_init.sql'), 'utf8');
+// Every PostgreSQL migration in order — the same set the application applies on
+// boot — so a later migration's columns are covered here too.
+const applyMigrations = async (client) =>
+  (await import('../dist/migrations.js')).applyMigrations(client);
 
 // ---------------------------------------------------------------------------
 // Primitives
@@ -102,7 +105,7 @@ test('cookies round-trip and carry the security attributes', () => {
 async function boot() {
   const db = new PGlite();
   const client = new PGliteClient(db);
-  await client.exec(MIGRATION);
+  await applyMigrations(client);
   const store = new PostgresStore(client);
   const layer = new AuthLayer(store, { secureCookies: true, exposeResetToken: false });
 

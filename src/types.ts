@@ -109,7 +109,30 @@ export interface DeliveryEstimate {
   destination: string | null;
   /** Destination postal code used for the lookup, when one was applied. */
   destinationPostalCode: string | null;
+  /**
+   * Why this seller has no parsed dates.
+   *
+   * 'NOT_SHOWN'      Amazon displayed no delivery estimate for THIS seller.
+   * 'UNPARSEABLE'    Text was displayed but did not contain a resolvable date.
+   * 'DELIVERY_AT_LOAD' Delivery is stated as "at checkout", not as a date.
+   *
+   * This distinction matters: "Amazon showed nothing for this seller" and "we
+   * failed to read something Amazon did show" are different facts, and a report
+   * that collapses them hides real extraction bugs behind a plausible blank.
+   */
+  unavailableReason: DeliveryUnavailableReason | null;
 }
+
+/**
+ * Why a per-seller delivery estimate is absent.
+ *
+ * `null` means an estimate WAS parsed. Anything else is an honest reason, never
+ * a fabricated date.
+ */
+export type DeliveryUnavailableReason =
+  | 'NOT_SHOWN'
+  | 'UNPARSEABLE'
+  | 'DELIVERY_AT_LOAD';
 
 /** A user-selectable delivery destination. */
 export interface Destination {
@@ -166,8 +189,24 @@ export interface SellerOffer {
   shippingFree: boolean | null;
   /** price + shipping, when both numbers were resolvable. */
   totalPrice: number | null;
-  /** Currency code. */
+  /**
+   * Currency code for THIS offer's amounts, resolved per row.
+   *
+   * Never inherited from a global default. See `currency.ts` for the rules;
+   * the short version is that a currency Amazon displayed wins, the
+   * marketplace is the fallback, and an unknown marketplace yields null.
+   */
   currency: string | null;
+  /** How `currency` was established, so an inferred value is not read as a fact. */
+  currencyStatus: import('./currency.js').CurrencyStatus | null;
+  /**
+   * Why this offer has no delivery estimate.
+   *
+   * Separate from `delivery === null` so "Amazon showed none" is distinguishable
+   * from "we could not parse one", and so a Buy Box date is never borrowed to
+   * fill a seller's blank.
+   */
+  deliveryStatus: import('./delivery.js').DeliveryStatus | null;
   /** Seller star rating as displayed, e.g. `4.6 من أصل 5 نجوم`. */
   ratingText: string | null;
   /** Numeric seller rating 0–5, when parseable. */
