@@ -1,0 +1,80 @@
+# SellerCtrl API — local web application.
+#
+# Installed to /etc/systemd/system/sellerctrl-api.service by
+# scripts/install-service.sh. Not enabled by the installer: enabling a service
+# that starts at boot is a deliberate decision, so it is left as a separate,
+# clearly-labelled step.
+#
+# Why a service rather than a terminal tab
+# ---------------------------------------
+# A `npm start` in a terminal dies with the terminal: closing the window, a
+# dropped SSH session, or a laptop suspend all stop the application. That is
+# almost certainly why localhost has "unexpectedly disconnected" before.
+
+[Unit]
+Description=SellerCtrl API (local Amazon seller scraper)
+# After=network-online.target — Playwright needs DNS before it can fetch
+# anything, and starting earlier just produces a failed first request.
+After=network-online.target
+Wants=network-online.target
+# A crash loop must not spin. systemd gives up after 5 restarts in the window
+# and marks the unit failed, which surfaces the problem instead of hiding it
+# behind a process that appears alive. These keys are only honoured in [Unit].
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Change WorkingDirectory to wherever the project actually lives on this
+# machine. The default below is the path this installation was created at.
+WorkingDirectory=%h/Documents/Default Project/amazon-scraper-mcp
+
+# `serve` runs the compiled output without re-running tsc on every start, so a
+# restart takes a second rather than a compile. Run `npm run build` first.
+ExecStart=/usr/bin/env node dist/server.js
+
+# Loopback only. This service must never bind a routable address: the app has no
+# authentication in local mode precisely because it is unreachable from the
+# network.
+Environment=HOST=127.0.0.1
+Environment=PORT=4310
+Environment=NODE_ENV=production
+# Slow Chromium work must not be killed by systemd's default 90s stop timeout.
+Environment=SHUTDOWN_TIMEOUT_MS=30000
+
+Restart=always
+RestartSec=5
+
+# Graceful shutdown: finish the request in flight, release Chromium, then exit.
+# The queue is persisted item-by-item, so a restart resumes rather than loses.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sellerctrl-api
+
+# ---------------------------------------------------------------------------
+# Hardening
+# ---------------------------------------------------------------------------
+# These restrict what a compromised scraper process could reach. They are set
+# conservatively: anything the app legitimately needs is allowed through.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# The database and reports are the only writable paths the app needs.
+ReadWritePaths="%h/Documents/Default Project/amazon-scraper-mcp/data"
+# Chromium needs to write its own profile somewhere it owns.
+ReadWritePaths=%h/.cache
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Loopback plus the local network stack only; no outbound restriction, because
+# scraping Amazon is the entire point.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target

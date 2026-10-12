@@ -73,10 +73,13 @@ async function init() {
     const blocked = health.blockedForSeconds > 0;
     $('status').innerHTML = blocked
       ? `<span class="blocked">Scraping paused (${health.blockedForSeconds}s)</span><br>${escapeHtml(health.blockReason ?? '')}`
-      : `<span class="ok">● ${health.marketplaces?.length ?? 5} marketplaces</span><br>cache ${health.cacheTtlSeconds}s · min ${health.pacing?.minIntervalMs ?? 4000}ms`;
+      : `<span class="ok">● ${health.marketplaceCount ?? state.marketplaces.length ?? 0} marketplaces</span><br>cache ${health.cacheTtlSeconds}s · min ${health.pacing?.minIntervalMs ?? 4000}ms`;
   } catch {
     $('status').textContent = 'server unreachable';
   }
+
+  // Real database counts, never estimates.
+  await loadDashboard();
 
   // Marketplace catalogue drives every selector in the UI.
   try {
@@ -773,6 +776,16 @@ async function startDirectUpload() {
   if (destination && destination.value) params.set('destination', destination.value);
 
   clearBanner();
+
+  // Background mode hands the job to the durable worker queue instead of
+  // scraping inside this page. The difference matters: a queued job keeps going
+  // after this tab is closed and after the server restarts, and it appears in
+  // History with its reports archived. The in-process path below stays available
+  // for one-off jobs where that is not wanted.
+  if ($b('directBackground')?.checked) {
+    return queueDirectUpload(form, params);
+  }
+
   busy($b('directStart'), true, 'Queuing…');
 
   try {
@@ -829,6 +842,153 @@ async function startDirectUpload() {
     banner('error', 'Upload failed', error.message);
   } finally {
     busy($b('directStart'), false);
+  }
+}
+
+/**
+ * Submit a Direct Upload to the durable queue.
+ *
+ * Nothing is scraped here: the job is written to the database and the worker
+ * picks it up. That is what makes it safe to close the tab.
+ */
+async function queueDirectUpload(form, params) {
+  busy($b('directStart'), true, 'Queuing…');
+  try {
+    const response = await fetch(`/api/queue/direct?${params}`, { method: 'POST', body: form });
+    const body = await response.json();
+
+    if (!response.ok) {
+      banner('error', body.error ?? 'Upload failed', '');
+      return;
+    }
+    if (body.needsColumn) {
+      const first = body.marketplaces?.[0];
+      banner(
+        'warn',
+        'The ASIN column could not be recognised.',
+        `${first?.files?.join(', ') ?? 'A file'} — headers: ${(first?.headers ?? []).join(', ') || '(none)'}`,
+      );
+      return;
+    }
+
+    $b('bulkQueuePanel').classList.remove('hidden');
+    $b('bulkProgressPanel').classList.remove('hidden');
+    $b('bulkImportStats').innerHTML =
+      statHtml('Input ASIN rows', body.inputRows) +
+      statHtml('Unique ASINs', body.uniqueAsins) +
+      statHtml('Duplicate rows', body.duplicates) +
+      statHtml('Blank rows ignored', body.blank) +
+      statHtml('Invalid values', body.invalid);
+
+    $b('bulkWorkload').innerHTML =
+      `Direct Upload — <strong>zero</strong> marketplace detection requests. ` +
+      `Each ASIN goes straight to its own marketplace product page.<br>` +
+      `${escapeHtml((body.marketplaces ?? []).join(', '))}`;
+
+    banner('info', `${body.queued} product-marketplace record(s) queued.`, body.message ?? '');
+
+    try { localStorage.setItem('scraperTool.queueJob', body.jobId); } catch { /* ignore */ }
+    pollQueueProgress(body.jobId);
+  } catch (error) {
+    banner('error', 'Upload failed', error.message);
+  } finally {
+    busy($b('directStart'), false);
+  }
+}
+
+/**
+ * Poll a queued job.
+ *
+ * Polling stops once the job reaches a terminal state, so an idle page does not
+ * keep talking to the server forever. The job itself is unaffected by this: it
+ * is running in the worker regardless of whether anything is watching.
+ */
+async function pollQueueProgress(jobId) {
+  if (!jobId) return;
+  $b('bulkProgressPanel').classList.remove('hidden');
+
+  for (;;) {
+    let detail = null;
+    try {
+      detail = await (await fetch(`/api/queue/jobs/${jobId}`)).json();
+    } catch {
+      // A transient network error must not abandon the display; the next tick
+      // picks it up again.
+      await new Promise((r) => setTimeout(r, 5000));
+      continue;
+    }
+    if (!detail || !detail.job) break;
+
+    const job = detail.job;
+    const total = job.uniqueAsins || 1;
+    const done = job.successfulRecords || 0;
+    const percent = Math.min(100, Math.round(((done + job.failedRecords) / total) * 100));
+
+    $b('bulkBar').style.width = `${percent}%`;
+    $b('bulkPercent').textContent = `${percent}%`;
+    $b('bulkImportStats').innerHTML =
+      statHtml('Status', job.status) +
+      statHtml('ASINs', total) +
+      statHtml('Completed', done) +
+      statHtml('Failed', job.failedRecords) +
+      statHtml('Not found', job.notFoundRecords) +
+      statHtml('Seller offers', job.totalSellerOffers) +
+      statHtml('Reports', job.reportCount);
+
+    if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(job.status)) {
+      $b('bulkWorkload').innerHTML =
+        `Job <strong>${job.status}</strong>. ` +
+        `${job.totalSellerOffers} seller offer(s) across ${done} product(s). ` +
+        'Reports are archived and downloadable from the History page.';
+      banner(
+        job.status === 'COMPLETED' ? 'info' : 'warn',
+        `Job ${job.status.toLowerCase()}.`,
+        'Open History to download the Excel and TSV reports.',
+      );
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+
+/**
+ * Load the dashboard counters.
+ *
+ * Nothing here is computed or estimated: each tile is a value the database
+ * reported. A failed request leaves the em dashes in place rather than showing
+ * zeros, so a broken endpoint is never mistaken for "nothing has been scraped".
+ */
+async function loadDashboard() {
+  const set = (id, value) => {
+    const el = $(id);
+    if (el) el.textContent = value;
+  };
+  try {
+    const res = await fetch('/api/stats');
+    if (!res.ok) return;
+    const s = await res.json();
+    const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString() : '—');
+
+    set('dash-total', num(s.totalJobs));
+    set('dash-completed', num(s.completedJobs));
+    set('dash-active', num(s.activeJobs));
+    set('dash-asins', num(s.totalUniqueAsins));
+    set('dash-offers', num(s.totalSellerOffers));
+    set('dash-reports', num(s.savedReports));
+    set('dash-last', s.lastScrapedAt ? String(s.lastScrapedAt).slice(0, 10) : '—');
+    set('dash-disk', s.freeDiskText ?? '—');
+
+    // Low disk is worth flagging before it silently truncates a job: a large
+    // batch needs room for its snapshots and its Excel export.
+    const strip = document.getElementById('dashboard');
+    if (strip && typeof s.freeDiskBytes === 'number') {
+      strip.classList.toggle('is-low', s.freeDiskBytes < 1024 * 1024 * 1024);
+      if (s.freeDiskBytes < 1024 * 1024 * 1024 && s.freeDiskText) {
+        strip.title = `Low disk space: ${s.freeDiskText} free. Free space before starting a large batch.`;
+      }
+    }
+  } catch {
+    /* leave the placeholders */
   }
 }
 

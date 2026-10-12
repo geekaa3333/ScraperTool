@@ -25,7 +25,7 @@
  * When Amazon restricts access the job is **paused**, never worked around: no
  * CAPTCHA solving, no proxy rotation, no fingerprint spoofing.
  */
-import type { PostgresStore } from './pg/store.js';
+import type { DataStore } from './pg/store-contract.js';
 import type { ReportStorage } from './storage/index.js';
 import { archiveJobReports } from './reports.js';
 import { getMarketplace, type MarketplaceId } from './marketplaces.js';
@@ -112,7 +112,7 @@ export class DurableJobWorker {
   private readonly heartbeatMs: number;
 
   constructor(
-    private readonly store: PostgresStore,
+    private readonly store: DataStore,
     private readonly scraper: WorkerScraper,
     private readonly storage: ReportStorage | null,
     private readonly options: DurableWorkerOptions = {},
@@ -278,6 +278,27 @@ export class DurableJobWorker {
       for (;;) {
         if (this.stopping || this.cancelled.has(job.jobId)) break;
 
+        // Pause and cancel are clicked in a browser, which is a different
+        // process from this worker, so the in-memory sets above can never see
+        // them. The status is re-read once per item — a single indexed row — so
+        // a stop takes effect within one ASIN rather than at the end of the job.
+        const status = await this.store.getJobStatus(job.userId, job.jobId);
+        if (status === 'CANCELLED') {
+          this.cancelled.add(job.jobId);
+          await this.store.setJobStatus(job.userId, job.jobId, 'CANCELLED');
+          this.emit({ type: 'job-cancelled', jobId: job.jobId });
+          this.logger.log(`[worker] job ${job.jobId} cancelled`);
+          return;
+        }
+        if (status === 'PAUSED') {
+          this.paused.add(job.jobId);
+          // Hand the lease back rather than waiting for it to expire, so the
+          // item does not sit invisible until another worker notices.
+          await this.store.reclaimExpiredLeases();
+          this.logger.log(`[worker] job ${job.jobId} paused`);
+          return;
+        }
+
         // Amazon's circuit breaker pauses the job. It is never worked around.
         if (this.scraper.blockedForSeconds() > 0) {
           const reason =
@@ -355,7 +376,20 @@ export class DurableJobWorker {
       });
     } catch (error) {
       const message = String((error as Error)?.message ?? error).slice(0, 1000);
-      await this.store.failItem(job.userId, job.jobId, item.marketplaceId, item.asin, message);
+      // A 404 is not a failure. Amazon confirmed the listing does not exist,
+      // which is a different fact from "we could not read the page", and History
+      // keeps them apart so a batch full of dead ASINs does not read as a run
+      // that fell over. Retrying a 404 would only re-ask for something already
+      // proven absent.
+      const notFound = /404|not found|not available|page doesn'?t exist/i.test(message);
+      await this.store.failItem(
+        job.userId,
+        job.jobId,
+        item.marketplaceId,
+        item.asin,
+        message,
+        notFound ? 'NOT_FOUND' : 'FAILED',
+      );
       this.emit({
         type: 'item-failed',
         jobId: job.jobId,
@@ -363,7 +397,9 @@ export class DurableJobWorker {
         asin: item.asin,
         reason: message,
       });
-      this.logger.warn(`[worker] item ${item.asin} (${item.marketplaceId}) failed: ${message}`);
+      this.logger.warn(
+        `[worker] item ${item.asin} (${item.marketplaceId}) ${notFound ? 'not found' : 'failed'}: ${message}`,
+      );
     }
   }
 

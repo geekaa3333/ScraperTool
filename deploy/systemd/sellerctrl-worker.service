@@ -1,0 +1,73 @@
+# SellerCtrl scraping worker — the durable background scraper.
+#
+# This is the process that makes SellerCtrl a desktop application rather than a
+# web demo. It runs independently of the API and of any browser, so scraping
+# survives the user closing their laptop lid application, switching browser, or
+# the API restarting for a deploy.
+#
+# Exactly one worker. A second would apply its own request pacing on top of the
+# first, doubling the request rate against Amazon. The application also enforces
+# this with a compare-and-swap lock in the database, so starting a second worker
+# by accident produces an idle process rather than a doubled request rate.
+
+[Unit]
+Description=SellerCtrl scraping worker (durable background scraper)
+After=network-online.target
+Wants=network-online.target
+# A crash loop must not spin. systemd gives up after 5 restarts in the window
+# and marks the unit failed, which surfaces the problem instead of hiding it
+# behind a process that appears alive. These keys are only honoured in [Unit].
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# The worker and the API share one SQLite file. Start them independently rather
+# than ordering them: either one may start first, and the schema is applied
+# idempotently by both.
+After=sellerctrl-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/Default Project/amazon-scraper-mcp
+ExecStart=/usr/bin/env node dist/worker-main.js
+Environment=NODE_ENV=production
+
+# Scraping is deliberately unhurried. SELLERCTRL_INTERVAL_MS is an
+# access-safety floor, not a performance knob — lowering it increases the load
+# on Amazon and brings restrictions closer.
+Environment=SELLERCTRL_INTERVAL_MS=4000
+
+# Lease must exceed the per-ASIN timeout, or an item could be reclaimed while it
+# is still being scraped. The worker refuses to start if this invariant is
+# violated, which is why the values are stated rather than left to defaults.
+Environment=AMAZON_TIMEOUT_MS=45000
+Environment=WORKER_LEASE_MS=300000
+
+# Chromium is recycled above this rather than allowed to grow without bound over
+# a multi-day job.
+Environment=WORKER_MEMORY_LIMIT_MB=3072
+
+Restart=always
+RestartSec=10
+
+# Finish the ASIN in flight before exiting. Anything still leased is reclaimed by
+# the next start, so a restart costs at most one ASIN and never loses work.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sellerctrl-worker
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths="%h/Documents/Default Project/amazon-scraper-mcp/data"
+ReadWritePaths=%h/.cache
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target

@@ -3,35 +3,31 @@
  * Standalone scraping worker process.
  *
  * Runs independently of the API and of any user browser. Start it as its own
- * service — a second container, a systemd unit, or a Railway worker service —
- * so scraping survives API restarts, deploys and closed laptops.
+ * systemd service so scraping survives an API restart, a deploy, or a closed
+ * terminal window.
  *
+ *   # local (no configuration needed)
+ *   npm run worker:start
+ *
+ *   # hosted multi-user
  *   DATABASE_URL=postgresql://... node dist/worker-main.js
  *
  * There is no maximum job duration. The worker keeps running until its queue is
- * drained, and the only bound anywhere is a per-ASIN timeout inside the scraper.
+ * drained, and the only bound anywhere is a per-ASIN timeout inside the
+ * scraper.
  *
- * Shutdown is graceful: SIGTERM finishes the ASIN in flight, releases Chromium,
- * and closes the database. The in-flight item's lease then expires and another
- * worker reclaims it, so a deploy costs at most one ASIN.
+ * Shutdown is graceful: SIGTERM finishes the ASIN in flight, releases Chromium
+ * and closes the database. The in-flight item's lease then expires and the item
+ * is reclaimed, so a restart costs at most one ASIN.
  */
-import { createDatabaseClient } from './pg/client.js';
-import { PostgresStore } from './pg/store.js';
+import { resolve } from 'node:path';
+import { createRuntime } from './runtime.js';
 import { DurableJobWorker } from './job-worker.js';
 import { ScrapeWorker } from './worker.js';
 import { createReportStorage } from './storage/index.js';
 
-const DATABASE_URL = process.env.DATABASE_URL ?? '';
 const WORKER_ID = process.env.WORKER_ID ?? `worker-${process.pid}`;
-
-if (!DATABASE_URL || DATABASE_URL === 'sqlite') {
-  console.error(
-    'DATABASE_URL is required for the standalone worker.\n' +
-    'The durable queue lives in PostgreSQL; SQLite cannot coordinate multiple\n' +
-    'workers or survive a container replacement.',
-  );
-  process.exit(1);
-}
+const DB_PATH = process.env.SELLERCTRL_DB ?? resolve(process.cwd(), 'data/sellerctrl.db');
 
 function log(event: { type: string; jobId: string; asin?: string; marketplaceId?: string; reason?: string }) {
   const bits = [`[${event.type}]`, `job=${event.jobId}`];
@@ -45,16 +41,9 @@ async function main(): Promise<void> {
   console.log(`[boot] SellerCtrl scraping worker starting as ${WORKER_ID}`);
   console.log('[boot] no job duration limit; jobs run until finished, paused or cancelled');
 
-  const client = await createDatabaseClient(DATABASE_URL);
-  const store = new PostgresStore(client);
-
-  // Apply the schema so a worker started before the API is not left waiting on
-  // tables that do not exist yet. Idempotent, so restarts are harmless.
-  const { readFileSync } = await import('node:fs');
-  const { fileURLToPath } = await import('node:url');
-  const { dirname, join } = await import('node:path');
-  const here = dirname(fileURLToPath(import.meta.url));
-  await client.exec(readFileSync(join(here, '..', 'migrations', '001_init.sql'), 'utf8'));
+  const runtime = await createRuntime({ dbPath: DB_PATH });
+  const { store } = runtime;
+  console.log(`[boot] database: ${runtime.kind} (${runtime.describe})`);
 
   const storage = createReportStorage();
   const scraper = new ScrapeWorker();
@@ -68,8 +57,8 @@ async function main(): Promise<void> {
     onProgress: log,
   });
 
-  // Anything a previous run was holding is handed back before starting, so a
-  // restart resumes rather than stalls.
+  // Hand back anything a previous run was holding before starting, so a restart
+  // resumes rather than stalls.
   const reclaimed = await store.reclaimExpiredLeases();
   if (reclaimed > 0) {
     console.log(`[boot] reclaimed ${reclaimed} item(s) left in flight by a previous run`);
@@ -82,7 +71,7 @@ async function main(): Promise<void> {
   worker.start();
 
   // Long runs need memory visibility. A leak shows up here long before it takes
-  // the container down.
+  // the process down.
   const memoryTimer = setInterval(() => {
     const usage = process.memoryUsage();
     const mb = (bytes: number) => (bytes / 1024 / 1024).toFixed(0);
@@ -92,11 +81,6 @@ async function main(): Promise<void> {
     );
     // Chromium over a multi-day run can drift upward. Above this, restarting
     // the browser reclaims it without interrupting the job.
-    //
-    // `usage.rss` is in bytes and the limit is in megabytes, so the conversion
-    // has to happen before the comparison. Comparing bytes directly against a
-    // megabyte figure is always true, which would recycle the browser on every
-    // tick and wreck throughput on a long job.
     const rssMb = usage.rss / 1024 / 1024;
     if (rssMb > Number(process.env.WORKER_MEMORY_LIMIT_MB ?? 3072)) {
       console.warn('[health] memory above limit; recycling Chromium');
@@ -126,8 +110,8 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
 
-  // A crash must be loud and fatal so the supervisor restarts the worker; the
-  // queue is durable, so restarting loses at most one leased item.
+  // A crash must be loud and fatal so systemd restarts the worker. The queue is
+  // durable, so restarting loses at most one leased item.
   process.on('unhandledRejection', (reason) => {
     console.error('[fatal] unhandled rejection:', reason);
     void shutdown('unhandledRejection');

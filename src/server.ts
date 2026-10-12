@@ -1,11 +1,14 @@
 import { createServer } from 'node:http';
 
-// Multi-user mode is opt-in. With no DATABASE_URL the tool behaves exactly as it
-// did before: one operator, SQLite, no accounts. Setting DATABASE_URL turns on
-// PostgreSQL-backed accounts, sessions and ownership-scoped history.
-import { createDatabaseClient } from './pg/client.js';
-import { PostgresStore } from './pg/store.js';
+// Local-first runtime. With no DATABASE_URL the application runs on local
+// SQLite with a durable queue, searchable history and archived reports, and no
+// account is required — it is a desktop application bound to loopback. Setting
+// DATABASE_URL switches to a hosted engine and turns accounts on, because a
+// shared deployment is what accounts exist for.
 import { AuthLayer } from './pg/http.js';
+import { createRuntime, LOCAL_USER_ID, type Runtime } from './runtime.js';
+import { QueueApi } from './queue-http.js';
+import type { DataStore } from './pg/store-contract.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -256,6 +259,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       blockReason: worker.blockReason,
       cacheTtlSeconds: CACHE_TTL_SECONDS,
       maxAsinsPerJob: MAX_ASINS_PER_JOB,
+    // Reported rather than left to the client to infer: the status line used to
+    // fall back to a hardcoded count, which silently misreported the number of
+    // supported marketplaces the moment a sixth was added.
+    marketplaceCount: MARKETPLACE_IDS.length,
       // Measured, not predicted: the pacing numbers come from the live queue.
       pacing: worker.pacing,
       uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
@@ -1077,6 +1084,10 @@ const server = createServer((req, res) => {
       // The schema is applied on boot; a request must not race it.
       if (databaseReady) await databaseReady;
 
+      // The durable queue, History and report downloads. Checked before the
+      // legacy handlers because these paths are new and do not overlap.
+      if (queueApi && (await queueApi.handle(req, res, url))) return;
+
       // Accounts, history and reports are served by the ownership-scoped layer.
       if (authLayer && (await authLayer.handle(req, res, url))) return;
 
@@ -1108,29 +1119,44 @@ const server = createServer((req, res) => {
 });
 
 const DATABASE_URL = process.env.DATABASE_URL ?? '';
-const MULTI_USER = DATABASE_URL !== '' && DATABASE_URL !== 'sqlite';
 
-let pgStore: PostgresStore | null = null;
+/**
+ * Runtime selection.
+ *
+ * Local SQLite is the default: `npm start` with no environment set gives a
+ * working application with a durable queue, searchable history and archived
+ * reports — no server to install, no account to create. Setting DATABASE_URL
+ * switches to a hosted engine, and accounts are required there because a shared
+ * deployment is exactly the case they exist for.
+ */
+let runtime: Runtime | null = null;
+let dataStore: DataStore | null = null;
 let authLayer: AuthLayer | null = null;
+let queueApi: QueueApi | null = null;
 let databaseReady: Promise<void> | null = null;
 
-if (MULTI_USER) {
-  databaseReady = (async () => {
-    const client = await createDatabaseClient(DATABASE_URL);
-    // Apply the schema on boot. It is written to be idempotent, so a restart or
-    // a redeploy re-runs it harmlessly.
-    const { readFileSync } = await import('node:fs');
-    const { fileURLToPath } = await import('node:url');
-    const { dirname, join } = await import('node:path');
-    const here = dirname(fileURLToPath(import.meta.url));
-    await client.exec(readFileSync(join(here, '..', 'migrations', '001_init.sql'), 'utf8'));
-    pgStore = new PostgresStore(client);
-    authLayer = new AuthLayer(pgStore, {
+databaseReady = (async () => {
+  runtime = await createRuntime({ dbPath: DB_PATH, databaseUrl: DATABASE_URL });
+  dataStore = runtime.store;
+
+  // Accounts are only switched on when a hosted database is configured, or when
+  // explicitly requested. Local mode has nothing to authenticate against: the
+  // only caller is the person at the keyboard on a loopback address.
+  if (runtime.requiresAuth) {
+    authLayer = new AuthLayer(runtime.store, {
       secureCookies: process.env.SECURE_COOKIES !== 'false',
       exposeResetToken: process.env.EXPOSE_RESET_TOKEN === 'true',
     });
-  })();
-}
+  }
+
+  queueApi = new QueueApi({
+    store: runtime.store,
+    localUserId: runtime.localUserId ?? LOCAL_USER_ID,
+    requiresAuth: runtime.requiresAuth,
+    resolveUser: authLayer ? (req) => authLayer!.currentUser(req) : undefined,
+    maxUploadBytes: MAX_UPLOAD_BYTES,
+  });
+})();
 
 /**
  * Routes that stay anonymous in multi-user mode.
@@ -1147,7 +1173,8 @@ server.listen(PORT, HOST, () => {
   console.error(`  database    : ${DB_PATH}`);
   console.error(`  cache TTL   : ${CACHE_TTL_SECONDS}s`);
   console.error(`  batch limit : ${MAX_ASINS_PER_JOB} ASIN rows`);
-  console.error(`  accounts    : ${MULTI_USER ? 'enabled (PostgreSQL)' : 'single-user mode'}`);
+  console.error(`  queue store : ${runtime?.kind ?? 'starting'} (${runtime?.describe ?? DB_PATH})`);
+  console.error(`  accounts    : ${authLayer ? 'enabled (sign-in required)' : 'local single-user (no sign-in)'}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -1209,6 +1236,10 @@ function shutdown(signal: string): Promise<void> {
     // Chromium may hold a crashed page; force it closed.
     await worker.close();
     store.close();
+    // Checkpoint the WAL so the .db file on disk is a complete database. Without
+    // this, recent commits live only in the -wal sidecar and a plain file copy
+    // would silently miss them.
+    await dataStore?.close().catch(() => undefined);
     console.error('Scraper Tool stopped cleanly');
     process.exit(0);
   })();

@@ -210,6 +210,8 @@
     // An inclusive end date becomes an exclusive upper bound on the next day,
     // so a job run on the selected day is still included.
     if (to) params.set('to', new Date(`${to}T23:59:59.999Z`).toISOString());
+    const sort = $('f-sort').value;
+    if (sort) params.set('sort', sort);
     params.set('limit', String(PAGE_SIZE));
     params.set('offset', String(state.offset));
     return params.toString();
@@ -220,7 +222,7 @@
     const tbody = $('rows');
     tbody.innerHTML = '<tr><td colspan="12" class="muted">Loading…</td></tr>';
     try {
-      const result = await api(`/api/jobs?${query()}`);
+      const result = await api(`/api/queue/jobs?${query()}`);
       state.jobs = result.jobs;
       state.total = result.total;
       renderRows();
@@ -293,7 +295,7 @@
 
     let detail;
     try {
-      detail = await api(`/api/jobs/${jobId}`);
+      detail = await api(`/api/queue/jobs/${jobId}`);
     } catch (error) {
       $('detail-facts').innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
       return;
@@ -377,7 +379,7 @@
     button.disabled = true;
     button.textContent = 'Generating…';
     try {
-      const result = await api(`/api/jobs/${jobId}/reports`, { method: 'POST' });
+      const result = await api(`/api/queue/jobs/${jobId}/reports`, { method: 'POST' });
       if (result.available === 0) {
         banner($('history-error'), 'No reports could be generated for this job.');
       } else {
@@ -425,6 +427,9 @@
       $('f-status').value = '';
       $('f-from').value = '';
       $('f-to').value = '';
+      // Reset to the default order too, so Clear genuinely returns to the
+      // starting view rather than leaving a sort the user did not choose.
+      $('f-sort').value = 'newest';
       state.offset = 0;
       loadHistory();
     });

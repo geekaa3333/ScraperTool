@@ -409,3 +409,19 @@ footer p { margin: 0; max-width: 760px; margin-inline: auto; }
   .field { min-width: 0; }
   th, td { padding: 8px; font-size: 13px; }
 }
+/* ── Dashboard strip ─────────────────────────────────────────────────────
+   A single quiet row above the tabs. Counts come from /api/stats and are real
+   database values; an unavailable figure renders as an em dash, never as 0. */
+.dashboard-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  padding: .6rem 1.25rem;
+  border-bottom: 1px solid var(--line, #e3e5e8);
+  font-size: .8rem;
+}
+.dash-item { display: flex; flex-direction: column; gap: .1rem; min-width: 5.5rem; }
+.dash-label { opacity: .6; text-transform: uppercase; letter-spacing: .04em; font-size: .68rem; }
+.dash-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+.dashboard-strip.is-low .dash-value { color: #b3261e; }
+.field.checkbox { display: flex; align-items: center; gap: .35rem; }

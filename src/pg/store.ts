@@ -8,6 +8,7 @@
  * belongs to another user simply does not match.
  */
 import type { SqlClient } from './client.js';
+import type { CreateJobInput, DataStore } from './store-contract.js';
 import {
   CSRF_COOKIE,
   SESSION_COOKIE,
@@ -118,7 +119,7 @@ export interface JobSummary {
   reportCount: number;
 }
 
-export class PostgresStore {
+export class PostgresStore implements DataStore {
   private workerLockHeld = false;
   private workerId: string | null = null;
 
@@ -351,7 +352,10 @@ export class PostgresStore {
     );
     const jobId = first(rows, 'createJob').job_id;
 
-    for (const [marketplaceId, count] of Object.entries(input.perMarketplace ?? {})) {
+    // Derived from the items when not supplied, so a job can never end up with
+    // an empty marketplace breakdown that History cannot filter on.
+    const perMarket = { ...derivePerMarketplace(input.items), ...(input.perMarketplace ?? {}) };
+    for (const [marketplaceId, count] of Object.entries(perMarket)) {
       await this.db.query(
         `INSERT INTO job_marketplaces (job_id, marketplace_id, user_id, input_asin_count, unique_asin_count)
          VALUES ($1, $2, $3, $4, $4)
@@ -552,6 +556,15 @@ export class PostgresStore {
     return rows.length ? toJobSummary(rows[0] as Record<string, unknown>) : null;
   }
 
+  async getJobStatus(userId: string, jobId: string): Promise<string | null> {
+    const { rows } = await this.db.query(
+      'SELECT status FROM scraping_jobs WHERE user_id = $1 AND job_id = $2',
+      [userId, jobId],
+    );
+    const row = rows[0] as { status: string } | undefined;
+    return row?.status ?? null;
+  }
+
   /**
    * Paginated, filtered history for the My Scraping History page.
    *
@@ -715,7 +728,7 @@ export class PostgresStore {
     marketplaceId: string,
     asin: string,
     detail: string,
-    status: 'FAILED' | 'RESTRICTED' = 'FAILED',
+    status: 'FAILED' | 'RESTRICTED' | 'NOT_FOUND' = 'FAILED',
   ): Promise<boolean> {
     const { rowCount } = await this.db.query(
       `UPDATE job_items SET status = $5, last_error = $6, leased_by = NULL,
@@ -746,6 +759,54 @@ export class PostgresStore {
     sql += ' ORDER BY marketplace_id, asin';
     const { rows } = await this.db.query(sql, params);
     return rows;
+  }
+
+  /** Rename a historical job. Scoped by owner like every other write. */
+  async renameJob(userId: string, jobId: string, jobName: string): Promise<boolean> {
+    const { rowCount } = await this.db.query(
+      'UPDATE scraping_jobs SET job_name = $3 WHERE user_id = $1 AND job_id = $2',
+      [userId, jobId, jobName.trim().slice(0, 200)],
+    );
+    return rowCount > 0;
+  }
+
+  /**
+   * Delete a history record.
+   *
+   * Report rows are only removed when `deleteReports` is true; otherwise they are
+   * detached so the files stay downloadable. On PostgreSQL the job's items,
+   * snapshots and offers cascade away, which is what frees the space.
+   */
+  async deleteJob(
+    userId: string,
+    jobId: string,
+    deleteReports = false,
+  ): Promise<{ deleted: boolean; removedReports: number }> {
+    const owned = await this.db.query('SELECT 1 FROM scraping_jobs WHERE user_id = $1 AND job_id = $2', [
+      userId,
+      jobId,
+    ]);
+    if (owned.rows.length === 0) return { deleted: false, removedReports: 0 };
+
+    let removedReports = 0;
+    if (deleteReports) {
+      const removed = await this.db.query(
+        'DELETE FROM generated_reports WHERE user_id = $1 AND job_id = $2',
+        [userId, jobId],
+      );
+      removedReports = removed.rowCount;
+    } else {
+      await this.db.query('UPDATE generated_reports SET job_id = NULL WHERE user_id = $1 AND job_id = $2', [
+        userId,
+        jobId,
+      ]);
+    }
+
+    const { rowCount } = await this.db.query('DELETE FROM scraping_jobs WHERE user_id = $1 AND job_id = $2', [
+      userId,
+      jobId,
+    ]);
+    return { deleted: rowCount > 0, removedReports };
   }
 
   async getMarketplaceProgress(userId: string, jobId: string) {
@@ -1206,6 +1267,19 @@ export class PostgresStore {
   async close(): Promise<void> {
     await this.db.close();
   }
+}
+
+/** Unique ASIN count per marketplace, computed from the items themselves. */
+function derivePerMarketplace(items: CreateJobInput['items']): Record<string, number> {
+  const seen = new Map<string, Set<string>>();
+  for (const item of items) {
+    // Counting per marketplace, not globally: the same ASIN in two marketplaces
+    // is two records and each must be counted in its own bucket.
+    const asins = seen.get(item.marketplaceId) ?? new Set<string>();
+    asins.add(item.asin);
+    seen.set(item.marketplaceId, asins);
+  }
+  return Object.fromEntries(Array.from(seen, ([marketplaceId, asins]) => [marketplaceId, asins.size]));
 }
 
 function toJobSummary(row: Record<string, unknown>): JobSummary {

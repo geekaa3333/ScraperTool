@@ -16,7 +16,7 @@
  * already keeps one row per seller offer, leaves unavailable prices blank, and
  * never substitutes zero.
  */
-import type { PostgresStore } from './pg/store.js';
+import type { DataStore } from './pg/store-contract.js';
 import {
   contentTypeFor,
   checksumOf,
@@ -56,7 +56,7 @@ export interface ArchiveInput {
  * workbook the user actually wants.
  */
 export async function archiveJobReports(
-  store: PostgresStore,
+  store: DataStore,
   storage: ReportStorage,
   input: ArchiveInput,
 ): Promise<ArchiveResult[]> {
@@ -145,7 +145,7 @@ export interface DownloadPayload {
  * storage at all.
  */
 export async function readReportForDownload(
-  store: PostgresStore,
+  store: DataStore,
   storage: ReportStorage,
   userId: string,
   reportId: string,
@@ -201,7 +201,7 @@ export interface RetentionResult {
 }
 
 export async function applyRetention(
-  store: PostgresStore,
+  store: DataStore,
   storage: ReportStorage,
   options: { retentionDays: number; limit?: number; now?: Date },
 ): Promise<RetentionResult> {

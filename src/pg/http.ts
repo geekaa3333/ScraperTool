@@ -13,7 +13,8 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-import type { PostgresStore, SessionUser } from './store.js';
+import type { SessionUser } from './store.js';
+import type { DataStore } from './store-contract.js';
 import { archiveJobReports, readReportForDownload, signedReportUrl } from '../reports.js';
 import { rowsForProduct } from '../exports.js';
 import type { ReportStorage } from '../storage/index.js';
@@ -59,7 +60,7 @@ export class AuthLayer {
   private readonly storage: ReportStorage;
 
   constructor(
-    private readonly store: PostgresStore,
+    private readonly store: DataStore,
     private readonly options: AuthLayerOptions,
   ) {
     this.maxAttempts = Number(process.env.LOGIN_RATE_LIMIT_MAX ?? 10);

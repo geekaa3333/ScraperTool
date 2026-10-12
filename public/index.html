@@ -26,6 +26,25 @@
       <button class="tab" data-tab="bulk">Bulk ASIN Scraper</button>
     </nav>
 
+    <!--
+      Dashboard counters.
+
+      Every figure is a real database count fetched from /api/stats. When a
+      number cannot be determined the tile shows "—", not "0": an unavailable
+      count and a count of zero are different facts and only one of them should
+      worry the user.
+    -->
+    <section class="dashboard-strip" id="dashboard" aria-label="Scraping overview">
+      <div class="dash-item"><span class="dash-label">Total jobs</span><span class="dash-value" id="dash-total">—</span></div>
+      <div class="dash-item"><span class="dash-label">Completed</span><span class="dash-value" id="dash-completed">—</span></div>
+      <div class="dash-item"><span class="dash-label">Active</span><span class="dash-value" id="dash-active">—</span></div>
+      <div class="dash-item"><span class="dash-label">Unique ASINs</span><span class="dash-value" id="dash-asins">—</span></div>
+      <div class="dash-item"><span class="dash-label">Seller offers</span><span class="dash-value" id="dash-offers">—</span></div>
+      <div class="dash-item"><span class="dash-label">Saved reports</span><span class="dash-value" id="dash-reports">—</span></div>
+      <div class="dash-item"><span class="dash-label">Last scrape</span><span class="dash-value" id="dash-last">—</span></div>
+      <div class="dash-item"><span class="dash-label">Free disk</span><span class="dash-value" id="dash-disk">—</span></div>
+    </section>
+
     <main>
       <!-- ════ existing single-ASIN tab ════ -->
       <div id="tab-single">
@@ -177,6 +196,10 @@
                   <option value="reuse">Use recent cached data</option>
                   <option value="refresh">Refresh live data</option>
                 </select>
+              </label>
+              <label class="field checkbox" title="Runs the job in the background worker instead of inside this page.">
+                <input type="checkbox" id="directBackground" checked />
+                <span>Run in background</span>
               </label>
               <span class="spacer"></span>
               <button id="directStart" class="primary">Start all enabled marketplaces</button>
