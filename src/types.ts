@@ -74,6 +74,14 @@ export interface ProductDetail extends Omit<SearchProduct, 'price'> {
   /** How `currency` was established, so an inference is not read as a fact. */
   currencyStatus: string | null;
   /**
+   * What localisation did before this price was read.
+   *
+   * Diagnostic only. It records whether the delivery destination and currency
+   * preference were actually applied, so a future price that looks wrong can be
+   * traced to a session that never localised rather than to the parser.
+   */
+  localisationNote?: string;
+  /**
    * Marketplace this product was scraped from. `amazon.eg` + ASIN and
    * `amazon.com` + the same ASIN are distinct records throughout the system.
    */

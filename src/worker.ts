@@ -1,4 +1,4 @@
-import type { Browser, Page } from 'playwright';
+import type { Browser, BrowserContext, Page } from 'playwright';
 import { chromium } from 'playwright';
 import * as cheerio from 'cheerio';
 import type {
@@ -14,6 +14,8 @@ import {
   AmazonScraperError,
 } from './scraper.js';
 import { parseOffers } from './offers.js';
+import { createLocalizedContext, localisePage, type LocalisationResult } from './localization.js';
+import { readDisplayedCurrency } from './scraper.js';
 import { record as recordTiming } from './timing.js';
 import {
   DEFAULT_MARKETPLACE,
@@ -173,6 +175,30 @@ export function defaultDestinationFor(marketplace: Marketplace): Destination {
 }
 
 /** Raise this when Amazon serves a restriction page. */
+/**
+ * A marketplace served prices in a currency other than its own.
+ *
+ * This is deliberately its own error type rather than a generic failure. The
+ * amount is real — Amazon really did print it — but attributing it to the
+ * marketplace would be false, so the item fails loudly and the reason travels
+ * with it into History instead of a plausible-but-wrong price.
+ *
+ * An EGP figure is never relabelled and never converted.
+ */
+export class AmazonCurrencyMismatchError extends AmazonScraperError {
+  constructor(
+    readonly marketplace: Marketplace,
+    readonly localisation: LocalisationResult,
+  ) {
+    super(
+      `${marketplace.domain} served ${localisation.displayedCurrency ?? 'no recognisable currency'} ` +
+        `instead of ${localisation.expectedCurrency}. ${localisation.note}`,
+      localisation.note,
+    );
+    this.name = 'AmazonCurrencyMismatchError';
+  }
+}
+
 export class AccessRestrictedError extends AmazonScraperError {
   constructor(
     message: string,
@@ -361,6 +387,52 @@ export class ScrapeWorker {
    * "product does not exist" apart from "we were blocked" — the distinction
    * that keeps automatic marketplace detection honest.
    */
+  /**
+   * Fetch a page and confirm it is priced in the marketplace's own currency.
+   *
+   * The verification lives HERE, before any product data is parsed, because a
+   * page served in a foreign currency would otherwise feed a perfectly correct
+   * parser the wrong numbers. Returning a clear mismatch is honest; accepting a
+   * 1,631.62 EGP amount as a US price is not.
+   *
+   * Localisation is only attempted for pages that carry prices, so search and
+   * availability checks do not pay for a destination round-trip.
+   */
+  private async fetchProductHtml(
+    page: Page,
+    context: BrowserContext,
+    url: string,
+    marketplace: Marketplace,
+    readySelector?: string,
+  ): Promise<{ html: string; localisation: LocalisationResult }> {
+    const first = await this.fetchHtml(page, url, readySelector);
+
+    // The destination control lives on the page itself, so localisation runs
+    // against the already-loaded product page and then reloads it.
+    const localisation = await localisePage(context, page, marketplace, readDisplayedCurrency, {
+      log: (message) => console.log(message),
+    });
+
+    // The reload inside localisePage already fetched a localised page; take its
+    // HTML rather than paying for another navigation.
+    const html = localisation.destinationApplied || localisation.preferenceCookie
+      ? (await this.fetchHtmlCurrent(page, readySelector)).html
+      : first;
+
+    if (!localisation.ok) {
+      throw new AmazonCurrencyMismatchError(marketplace, localisation);
+    }
+    return { html, localisation };
+  }
+
+  /** HTML of the page currently loaded, without navigating. */
+  private async fetchHtmlCurrent(page: Page, readySelector?: string): Promise<{ html: string }> {
+    if (readySelector) {
+      await page.waitForSelector(readySelector, { timeout: READY_TIMEOUT_MS }).catch(() => undefined);
+    }
+    return { html: await page.content() };
+  }
+
   private async fetchHtml(page: Page, url: string, readySelector?: string): Promise<string> {
     this.assertNotBlocked();
 
@@ -454,18 +526,19 @@ export class ScrapeWorker {
    * Run `task` inside a fresh context so cookies never leak between calls and
    * memory is released as soon as the scrape finishes.
    */
-  private async withPage<T>(marketplace: Marketplace, task: (page: Page) => Promise<T>): Promise<T> {
+  private async withPage<T>(
+    marketplace: Marketplace,
+    task: (page: Page, context: BrowserContext) => Promise<T>,
+  ): Promise<T> {
     const contextStarted = process.hrtime.bigint();
     const browser = await this.getBrowser();
-    const context = await browser.newContext({
-      userAgent: USER_AGENT,
-      locale: marketplace.locale,
-      viewport: { width: 1440, height: 900 },
-    });
+    // An isolated context PER MARKETPLACE. Nothing is shared, so a delivery
+    // address set for the UK cannot leak onto amazon.ae and price it in pounds.
+    const context = await createLocalizedContext(browser, marketplace);
     const page = await context.newPage();
     recordTiming('context', Number(process.hrtime.bigint() - contextStarted) / 1e6);
     try {
-      return await task(page);
+      return await task(page, context);
     } finally {
       // Always release the context, including on a restriction throw.
       await context.close().catch(() => undefined);
@@ -479,7 +552,7 @@ export class ScrapeWorker {
     marketplace: Marketplace = getMarketplace(DEFAULT_MARKETPLACE),
   ): Promise<SearchProduct[]> {
     const url = searchUrl(marketplace, query.trim());
-    const html = await this.withPage(marketplace, (page) =>
+    const html = await this.withPage(marketplace, (page, _context) =>
       this.fetchHtml(page, url, SEARCH_READY_SELECTOR),
     );
     return parseSearchResults(html, maxResults, marketplace);
@@ -503,7 +576,7 @@ export class ScrapeWorker {
     const url = productUrl(marketplace, asin);
 
     try {
-      const html = await this.withPage(marketplace, (page) =>
+      const html = await this.withPage(marketplace, (page, _context) =>
       this.fetchHtml(page, url, SEARCH_READY_SELECTOR),
     );
       // A real product page always has a title element.
@@ -540,9 +613,18 @@ export class ScrapeWorker {
     const productPage = productUrl(marketplace, asin);
     const offersPage = offersUrl(marketplace, asin);
 
-    return this.withPage(marketplace, async (page) => {
+    return this.withPage(marketplace, async (page, context) => {
       // --- product detail ---
-      const productHtml = await this.fetchHtml(page, productPage, PRODUCT_READY_SELECTOR);
+      // Localised first: the delivery destination and currency preference are
+      // applied and the page reloaded BEFORE any price is read, so a UK or US
+      // listing cannot be captured in EGP and relabelled afterwards.
+      const { html: productHtml, localisation } = await this.fetchProductHtml(
+        page,
+        context,
+        productPage,
+        marketplace,
+        PRODUCT_READY_SELECTOR,
+      );
       const parseStarted = process.hrtime.bigint();
       const product = parseProductDetail(productHtml, asin, marketplace);
       recordTiming('product-parse', Number(process.hrtime.bigint() - parseStarted) / 1e6);
@@ -589,6 +671,8 @@ export class ScrapeWorker {
       }
 
       // --- offers ---
+      // Same context, so it inherits the destination and currency preference the
+      // product page established. Every seller offer is priced accordingly.
       const offersHtml = await this.fetchHtml(page, offersPage, OFFERS_READY_SELECTOR);
       const offersParseStarted = process.hrtime.bigint();
       const parsed = parseOffers(offersHtml, {
@@ -618,6 +702,7 @@ export class ScrapeWorker {
         offersTotalCount: parsed.totalCount,
         offersPagesFetched: parsed.pagesFetched,
         scrapedAt: now.toISOString(),
+        localisationNote: localisation.note,
         destination,
         buyBoxDeliveryText,
         provenance: {

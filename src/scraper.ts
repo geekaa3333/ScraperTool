@@ -418,6 +418,47 @@ export async function searchProducts(
   }
 }
 
+
+/**
+ * Read the currency a LIVE page is actually serving.
+ *
+ * This is the verification step, and it is deliberately independent of the
+ * product parser: it reads the rendered price elements straight from the DOM so
+ * a localisation failure is detected before any product data is accepted.
+ *
+ * Returns null when no currency-bearing price is on screen, which is different
+ * from "the page served the wrong currency" and must not be conflated with it.
+ */
+export async function readDisplayedCurrency(page: Page): Promise<string | null> {
+  // Selectors are passed in rather than closed over: the callback executes in the
+  // browser, and this project targets Node without the DOM lib, so referencing
+  // `document` directly in here is not typed.
+  const selectors = [
+    '#corePrice_feature_div .a-price .a-offscreen',
+    '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
+    '#apex_desktop .a-price .a-offscreen',
+    '#price_inside_buybox',
+    '#priceblock_ourprice',
+    '#priceblock_dealprice',
+    '.a-price .a-offscreen',
+  ];
+
+  try {
+    const text = await page.evaluate((list: string[]) => {
+      // Minimal structural type: the DOM lib is not part of this project's target.
+      const doc = (globalThis as unknown as { document: { querySelector(s: string): { textContent: string | null } | null } }).document;
+      for (const selector of list) {
+        const value = doc.querySelector(selector)?.textContent?.trim();
+        if (value) return value;
+      }
+      return null;
+    }, selectors);
+    return detectCurrencyInText(text);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Scrape a single product detail page.
  *
