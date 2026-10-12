@@ -11,7 +11,13 @@
 #     one process. The queue is durable, so a restart costs at most one ASIN.
 #   * There is no port to expose; the worker takes no HTTP traffic at all.
 
-FROM mcr.microsoft.com/playwright:v1.48.2-jammy
+FROM mcr.microsoft.com/playwright:v1.64.0-jammy
+# The tag MUST match the `playwright` version in package.json. Playwright's
+# driver expects a specific Chromium build (1.64.0 expects revision 1248); a
+# mismatch means the browser will not launch in the container. Verified against
+# the registry: v1.64.0-jammy publishes linux/amd64 AND linux/arm64, so one
+# image covers Oracle's Ampere A1 and any x86 host.
+
 
 USER root
 

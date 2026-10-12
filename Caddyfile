@@ -1,0 +1,54 @@
+# Caddy — HTTPS reverse proxy for the SellerCtrl API.
+#
+# Caddy is used because it obtains and renews a Let's Encrypt certificate
+# automatically and needs no renewal cron, which matters on a host nobody is
+# going to remember to maintain.
+#
+# HOSTNAME is read from the environment so one file works for every environment.
+# Set it to your DuckDNS name (see FREE-DEPLOY.md). If it is empty, Caddy serves
+# plain HTTP on :80 only — useful for a local smoke test, never for production.
+
+{
+	email {$ACME_EMAIL:admin@example.com}
+	# Uncomment to test the full certificate flow against Let's Encrypt's staging
+	# environment first. Staging certificates are not trusted by browsers, so
+	# leave this off once the real one works.
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$HOSTNAME:localhost} {
+	encode zstd gzip
+
+	# The API is plain HTTP inside the compose network; TLS terminates here.
+	reverse_proxy api:4310 {
+		# Scraping is asynchronous, but report downloads and Excel uploads can be
+		# long-running requests. Caddy's defaults are generous; these are set
+		# explicitly so the limits are visible rather than inherited.
+		transport http {
+			read_timeout 300s
+			write_timeout 300s
+		}
+	}
+
+	# Never index the API.
+	header {
+		X-Robots-Tag "noindex, nofollow"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# HSTS is set by the Netlify frontend already; setting it here as well means
+	# the API origin is also pinned to HTTPS if it is ever contacted directly.
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	# Private responses must never be cached by an intermediary.
+	@api path /api/*
+	header @api Cache-Control "no-store, private"
+
+	log {
+		output stdout
+		format console
+	}
+}

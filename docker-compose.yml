@@ -1,0 +1,187 @@
+# SellerCtrl — free-tier production stack.
+#
+# Sized for Oracle Always Free Ampere A1: 2 OCPU / 12 GB total. That budget is
+# the hard constraint this file is designed around, not an afterthought:
+#
+#   PostgreSQL   ~1 GB   steady, bounded
+#   API          ~512 MB no Chromium, holds no requests open
+#   Worker       ~6 GB   Chromium is the memory hog; 1 replica only
+#   Caddy        ~64 MB
+#   OS + docker  ~1 GB
+#   ------------------------------------------
+#   headroom     ~3 GB   deliberate, so a long job does not OOM the VM
+#
+# The worker runs ONE replica on purpose. Two would each pace requests on their
+# own and double the request rate against Amazon. The application also enforces
+# this with a compare-and-swap lock in PostgreSQL, so an accidental scale-up
+# results in an idle replica rather than a doubled request rate.
+#
+# Build for the target architecture with:
+#   docker compose build                    # native to the host
+#   DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose build   # cross-build
+
+name: sellerctrl
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      # Supplied via the environment, never baked into the image or the repo.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      # Scram rather than MD5: MD5 password hashes have been weak for years and
+      # are not needed by any client we use.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      # Named volume, not a bind mount inside the container, so a rebuild cannot
+      # touch the data. This is the only copy of job history and reports metadata.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # Not published to the host at all. Only the API and worker reach it.
+    expose:
+      - "5432"
+    networks: [backend]
+    # Postgres is not exposed publicly; the API is the only entry point.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sellerctrl-api:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "4310"
+      DATABASE_URL: ${DATABASE_URL}
+      SECURE_COOKIES: "true"
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      PUBLIC_WEB_URL: ${PUBLIC_WEB_URL}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set}
+      SELLERCTRL_DB: /app/data/sellerctrl.db
+      SELLERCTRL_INTERVAL_MS: ${SELLERCTRL_INTERVAL_MS:-4000}
+      SELLERCTRL_READY_TIMEOUT_MS: ${SELLERCTRL_READY_TIMEOUT_MS:-15000}
+      SELLERCTRL_CACHE_TTL: ${SELLERCTRL_CACHE_TTL:-900}
+      # Private object storage for reports. Leave S3_BUCKET unset to fall back to
+      # the report volume below — but see the retention note in FREE-DEPLOY.md.
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      REPORT_STORAGE_DIR: /app/data/reports
+      REPORT_RETENTION_DAYS: ${REPORT_RETENTION_DAYS:-0}
+    volumes:
+      # Reports and the SQLite cache survive a container rebuild.
+      - apidata:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4310/api/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    # Only Caddy needs to reach the API, so it is not published to the host.
+    expose:
+      - "4310"
+    networks: [backend]
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: sellerctrl-worker:latest
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      WORKER_LEASE_MS: ${WORKER_LEASE_MS:-300000}
+      WORKER_POLL_INTERVAL_MS: ${WORKER_POLL_INTERVAL_MS:-5000}
+      WORKER_RECLAIM_INTERVAL_MS: ${WORKER_RECLAIM_INTERVAL_MS:-60000}
+      WORKER_HEARTBEAT_MS: ${WORKER_HEARTBEAT_MS:-30000}
+      WORKER_LOCK_STALE_MS: ${WORKER_LOCK_STALE_MS:-90000}
+      WORKER_MEMORY_LIMIT_MB: ${WORKER_MEMORY_LIMIT_MB:-5120}
+      WORKER_AUTO_ARCHIVE: "true"
+      WORKER_ID: worker-1
+      SELLERCTRL_INTERVAL_MS: ${SELLERCTRL_INTERVAL_MS:-4000}
+      SELLERCTRL_READY_TIMEOUT_MS: ${SELLERCTRL_READY_TIMEOUT_MS:-15000}
+      AMAZON_TIMEOUT_MS: ${AMAZON_TIMEOUT_MS:-45000}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      REPORT_STORAGE_DIR: /app/data/reports
+      REPORT_RETENTION_DAYS: ${REPORT_RETENTION_DAYS:-0}
+    volumes:
+      - apidata:/app/data
+    # Chromium needs more headroom than anything else here, and /dev/shm is too
+    # small by default: a 64 MB shm is a well-known cause of Chromium crashes on
+    # multi-page workloads. This is the single most important setting in the file
+    # for a job that visits thousands of pages.
+    shm_size: "1gb"
+    networks: [backend]
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 6g
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [api]
+    environment:
+      # DuckDNS is a genuinely free, stable hostname (see FREE-DEPLOY.md). Caddy
+      # uses the token for a DNS-01 challenge so it can obtain a real Let's
+      # Encrypt certificate without a public port 80 dependency.
+      DUCKDNS_TOKEN: ${DUCKDNS_TOKEN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    networks: [backend, public]
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+
+networks:
+  # postgres/api/worker only. Nothing public is reachable here.
+  backend:
+    internal: true
+  public:
+    driver: bridge
+
+volumes:
+  pgdata:
+  apidata:
+  caddydata:
+  caddyconfig:

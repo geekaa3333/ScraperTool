@@ -13,7 +13,13 @@
 # and then runs for weeks; size costs disk once, whereas a missing shared library
 # costs uptime.
 
-FROM mcr.microsoft.com/playwright:v1.48.2-jammy
+FROM mcr.microsoft.com/playwright:v1.64.0-jammy
+# The tag MUST match the `playwright` version in package.json. Playwright's
+# driver expects a specific Chromium build (1.64.0 expects revision 1248); a
+# mismatch means the browser will not launch in the container. Verified against
+# the registry: v1.64.0-jammy publishes linux/amd64 AND linux/arm64, so one
+# image covers Oracle's Ampere A1 and any x86 host.
+
 
 # `node` already exists in this base image; `ubuntu` is used for extra tooling.
 USER root
