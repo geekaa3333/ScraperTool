@@ -51,7 +51,7 @@ export interface SearchProduct {
 }
 
 /** Full detail scraped from a single product detail page. */
-export interface ProductDetail extends SearchProduct {
+export interface ProductDetail extends Omit<SearchProduct, 'price'> {
   brand: string | null;
   /** `In stock`, `Currently unavailable`, or `null` when not stated. */
   availability: string | null;
@@ -60,8 +60,19 @@ export interface ProductDetail extends SearchProduct {
   description: string | null;
   /** Marketplace host the detail was read from, e.g. `amazon.eg`. */
   domain: string;
+  /** Numeric product price, parsed when unambiguous. Null when not stated. */
+  price: number | null;
+  /**
+   * The price exactly as displayed, e.g. `AED64.64`.
+   *
+   * Kept beside the numeric value rather than instead of it: the number lets
+   * Excel sort and sum, the text proves what Amazon actually printed.
+   */
+  priceText: string | null;
   /** ISO currency code resolved from the page, e.g. `EGP`. */
   currency: string | null;
+  /** How `currency` was established, so an inference is not read as a fact. */
+  currencyStatus: string | null;
   /**
    * Marketplace this product was scraped from. `amazon.eg` + ASIN and
    * `amazon.com` + the same ASIN are distinct records throughout the system.

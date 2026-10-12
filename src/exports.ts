@@ -54,7 +54,10 @@ export interface ExportRow {
   productTitle: string | null;
   brand: string | null;
   productUrl: string | null;
-  productPrice: string | null;
+  /** Numeric where a reliable number was parsed; null when Amazon stated none. */
+  productPrice: number | null;
+  /** The price exactly as displayed, beside the numeric value. */
+  productPriceText: string | null;
   productRating: string | null;
   reviewCount: string | null;
   productAvailability: string | null;
@@ -128,7 +131,8 @@ export const EXPORT_COLUMNS: Column[] = [
   { key: 'productTitle', header: 'Product Title', width: 46 },
   { key: 'brand', header: 'Brand', width: 18 },
   { key: 'productUrl', header: 'Product URL', width: 40 },
-  { key: 'productPrice', header: 'Product Price', width: 14 },
+  { key: 'productPrice', header: 'Product Price', width: 14, numeric: true },
+  { key: 'productPriceText', header: 'Product Price (as displayed)', width: 22 },
   { key: 'productRating', header: 'Product Rating', width: 14 },
   { key: 'reviewCount', header: 'Review Count', width: 13 },
   { key: 'productAvailability', header: 'Availability', width: 18 },
@@ -209,7 +213,10 @@ export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
     productTitle: product.title,
     brand: product.brand,
     productUrl: product.url,
+    // Numeric so Excel can sort and sum, with the verbatim string beside it
+    // as the proof of what Amazon printed.
     productPrice: product.price,
+    productPriceText: product.priceText ?? null,
     productRating: product.rating,
     reviewCount: product.reviewCount,
     productAvailability: product.availability,
@@ -378,6 +385,7 @@ export function failedRow(
     brand: null,
     productUrl: null,
     productPrice: null,
+    productPriceText: null,
     productRating: null,
     reviewCount: null,
     productAvailability: null,

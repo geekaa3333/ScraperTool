@@ -82,12 +82,33 @@ test('currency tokens are read from price text in every script', () => {
     ['CDN$ 12.00', 'CAD'],
     ['£12.50', 'GBP'],
     ['GBP 9.99', 'GBP'],
-    ['$19.99', 'USD'],
     ['US$ 5.00', 'USD'],
   ];
   for (const [text, expected] of cases) {
     assert.equal(detectCurrencyInText(text), expected, `"${text}" should read as ${expected}`);
   }
+});
+
+test('currency codes abutting a digit are detected', () => {
+  // Amazon renders codes with no space at all. A \\b boundary fails against the
+  // following digit, which silently missed every one of these — and a missed
+  // code is exactly how a real mismatch between page and marketplace goes
+  // unflagged.
+  assert.equal(detectCurrencyInText('EGP2,694.42'), 'EGP');
+  assert.equal(detectCurrencyInText('AED64.64'), 'AED');
+  assert.equal(detectCurrencyInText('GBP9.99'), 'GBP');
+  // But a code must still not match inside an unrelated word.
+  assert.equal(detectCurrencyInText('gadgets and things'), null);
+  assert.equal(detectCurrencyInText('some USDollar text'), null);
+});
+
+test('a bare dollar sign is ambiguous and is not currency evidence', () => {
+  // amazon.ca and amazon.com both render '$'. Reading it as USD would flag
+  // every Canadian listing as a mismatch, and reading it as CAD would flag
+  // every US one. An ambiguous token is not evidence: the marketplace decides.
+  assert.equal(detectCurrencyInText('$19.99'), null);
+  assert.equal(detectCurrencyInText('$19.99 USD'), 'USD', 'an explicit code still counts');
+  assert.equal(resolveCurrency('ca', detectCurrencyInText('$36.99')).status, 'VERIFIED_FROM_MARKETPLACE');
 });
 
 test('a bare number carries no currency information', () => {

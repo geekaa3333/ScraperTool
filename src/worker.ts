@@ -605,7 +605,12 @@ export class ScrapeWorker {
       return {
         ...product,
         domain: marketplace.domain,
-        currency: marketplace.currency,
+        // NOT `marketplace.currency`. That overwrote whatever currency the page
+        // actually displayed, which defeated mismatch detection entirely: a UK
+        // page printing "EGP2,694.42" was relabelled GBP and the disagreement
+        // disappeared. The scraper's resolved currency — which preserves an
+        // observed code and flags a mismatch — is kept.
+        currency: product.currency ?? marketplace.currency,
         marketplaceId: marketplace.id,
         offers: parsed.offers,
         offersComplete: parsed.complete,

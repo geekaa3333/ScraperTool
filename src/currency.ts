@@ -128,7 +128,12 @@ export function isSingleCurrency(codes: Array<string | null>): boolean {
 const ALL_TOKENS: Array<[string, string]> = [
   // Symbols and codes, longest first so `ca$` wins over `$`.
   ['ca$', 'CAD'], ['cdn$', 'CAD'], ['c$', 'CAD'], ['cad', 'CAD'],
-  ['us$', 'USD'], ['usd', 'USD'], ['$', 'USD'],
+  ['us$', 'USD'], ['usd', 'USD'],
+  // A bare '$' is deliberately ABSENT from this table. amazon.ca and amazon.com
+  // both render it, and it is genuinely ambiguous between USD and CAD. Treating
+  // it as evidence of USD would flag every Canadian listing as a currency
+  // mismatch. The marketplace decides when a token is ambiguous; only an
+  // unambiguous token (`CA$`, `US$`, `USD`, `CAD`) counts as evidence.
   ['gbp', 'GBP'], ['£', 'GBP'],
   ['aed', 'AED'], ['د.إ', 'AED'], ['د إ', 'AED'], ['درهم', 'AED'], ['dhs', 'AED'],
   ['sar', 'SAR'], ['ر.س', 'SAR'], ['ر س', 'SAR'], ['ر.ي', 'SAR'], ['ريال', 'SAR'], ['س.ر', 'SAR'], ['srls', 'SAR'],
@@ -155,8 +160,14 @@ export function detectCurrencyInText(text: string | null | undefined): string | 
     const needle = token.toLowerCase();
     // Word-ish tokens need boundaries so `dhs` cannot match inside a product
     // name and `c$` cannot match the `c` of an unrelated word.
+    //
+    // The right boundary is "not a letter", not "\b". Amazon renders codes with
+    // no space at all -- "EGP2,694.42", "AED64.64" -- and a `\b` after EGP
+    // fails there because a digit is a word character. That silently missed
+    // every one of those, which is exactly the case where the observed currency
+    // disagrees with the marketplace and must be flagged.
     if (/^[a-z]+$/.test(needle)) {
-      if (new RegExp(`\\b${regexEscape(needle)}\\b`, 'i').test(haystack)) return code;
+      if (new RegExp(`(?<![a-z])${regexEscape(needle)}(?![a-z])`, 'i').test(haystack)) return code;
     } else if (haystack.includes(needle)) {
       return code;
     }

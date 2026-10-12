@@ -119,7 +119,13 @@ const CURRENCY_TOKENS: Record<MarketplaceId, string[]> = {
   uk: ['£', 'gbp'],
   // Saudi Riyal symbols were previously listed here; they belong to amazon.sa
   // and never appear on amazon.ca.
-  ca: ['ca$', 'cdn$', 'c$', 'cad'],
+  // '$' is listed here so the NUMBER parses on an amazon.ca page that renders a
+  // bare dollar sign. That is deliberately separate from currency evidence:
+  // `detectCurrencyInText` does not treat a bare '$' as identifying anything,
+  // because it is genuinely ambiguous between USD and CAD. Parsing the amount
+  // and resolving the currency are two different questions — 36.99 is 36.99
+  // whichever currency it turns out to be.
+  ca: ['ca$', 'cdn$', 'c$', 'cad', '$'],
   us: ['$', 'usd', 'us$'],
 };
 
@@ -225,6 +231,43 @@ export function parsePrice(text: string | null, marketplace: Marketplace = getMa
   }
 
   return null;
+}
+
+
+/**
+ * Parse a price that is denominated in a currency other than the marketplace's.
+ *
+ * `parsePrice` is deliberately marketplace-scoped: a pound price on an Egyptian
+ * listing must NOT come back as a number, because a number with no currency is
+ * exactly how an EGP-labelled amount ends up holding pounds. When the page
+ * genuinely prints a different currency, that is a real observation and the
+ * amount is worth capturing — but only when the caller has already established
+ * the mismatch, and always alongside the observed currency code so the report
+ * can flag the disagreement.
+ *
+ * Returns null when the text does not carry a recognised currency token, so a
+ * bare number is still never guessed at.
+ */
+export function parsePriceInDisplayedCurrency(text: string | null): number | null {
+  if (!text) return null;
+  const normalized = stripBidi(
+    text
+      .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+      .replace(/٫/g, '.')
+      .replace(/٬/g, ',')
+      .replace(/\s+/g, ' ')
+      .trim(),
+  );
+  if (!detectCurrencyInText(normalized)) return null;
+
+  // Strict money shapes only. Grouping runs must be exactly three digits, so a
+  // European decimal comma like "309,50" is rejected rather than read as 30950.
+  const match = /(?:^|[^\d.,])(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?![\d])/.exec(
+    normalized,
+  );
+  if (!match?.[1]) return null;
+  const value = Number(match[1].replace(/,/g, ''));
+  return Number.isFinite(value) ? value : null;
 }
 
 /** Pull the `seller=A…` id out of a seller profile link. */

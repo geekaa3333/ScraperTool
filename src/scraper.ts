@@ -1,6 +1,8 @@
 import type { Browser, Page } from 'playwright';
 import { chromium } from 'playwright';
 import * as cheerio from 'cheerio';
+import { parsePrice, parsePriceInDisplayedCurrency } from './offers.js';
+import { detectCurrencyInText, resolveCurrency } from './currency.js';
 import type { ProductDetail, SearchProduct } from './types.js';
 import {
   DEFAULT_MARKETPLACE,
@@ -237,7 +239,12 @@ export function parseSearchResults(
       title:
         pickText(find, ['h2 span', 'h2 a span', '[data-cy="title-recipe"] h2 span', 'h2']) ?? `ASIN ${asin}`,
       url: absoluteUrl(href, marketplace),
-      price: pickText(find, ['.a-price .a-offscreen', '.a-price', '[data-cy="price-recipe"]']),
+      // The product price is displayed as text ("AED64.64", "£12.50"), so it is
+    // stored BOTH ways: the verbatim string for display, and the parsed number so
+    // Excel can sort and sum it. Previously only the text was kept, which left
+    // the numeric product price permanently blank in every export even when
+    // Amazon had plainly printed one.
+    price: pickText(find, ['.a-price .a-offscreen', '.a-price', '[data-cy="price-recipe"]']),
       rating:
         pickAttr(find, ['[aria-label*="out of 5 stars"]'], 'aria-label') ??
         pickText(find, ['.a-icon-alt', '[data-cy="reviews-ratings-slot"] .a-icon-alt']),
@@ -303,12 +310,31 @@ export function parseProductDetail(
 
   const availability = clean(pickText($, ['#availability span', '#availability', '#outOfStock .a-color-price']));
 
+  // Whatever currency the page actually printed, read before falling back to the
+  // marketplace's own. This is what lets a genuine mismatch be flagged instead of
+  // silently corrected.
+  // Read once and reused: the displayed price text drives both the numeric
+  // amount and the currency, and they must never be read from different sources.
+  const priceText = pickText($, [
+    '#corePriceDisplay_desktop_feature_div .a-offscreen',
+    '#corePrice_feature_div .a-offscreen',
+    '#price_inside_buybox',
+    '#priceblock_ourprice',
+    '#priceblock_dealprice',
+    '.a-price .a-offscreen',
+  ]);
+
+  const currencyToken = detectCurrencyInText(priceText);
+
   return {
     asin,
     title,
     url: buildProductUrl(marketplace, asin),
     brand,
-    price: pickText($, [
+    // Stored both ways: verbatim text for display, parsed number so Excel can
+    // sort and sum. Only the text was kept before, which left the numeric
+    // product price permanently blank in every export.
+    priceText: pickText($, [
       '#corePriceDisplay_desktop_feature_div .a-offscreen',
       '#corePrice_feature_div .a-offscreen',
       '#price_inside_buybox',
@@ -316,6 +342,13 @@ export function parseProductDetail(
       '#priceblock_dealprice',
       '.a-price .a-offscreen',
     ]),
+    // Marketplace-scoped first. Only if that yields nothing AND the page
+    // printed a recognised foreign currency do we take the amount on the
+    // currency's own terms — a UK page showing "EGP2,694.42" really is 2694.42
+    // EGP, and blanking it would throw away a price Amazon plainly printed.
+    // The currency below records EGP and flags the mismatch.
+    price:
+      parsePrice(priceText, marketplace) ?? parsePriceInDisplayedCurrency(priceText),
     rating: pickText($, [
       '#acrPopover .a-icon-alt',
       'span[data-hook="rating-out-of-text"]',
@@ -331,9 +364,18 @@ export function parseProductDetail(
     ]),
     image: pickAttr($, ['#landingImage', '#imgTagWrapperId img', '#main-image'], 'src'),
     domain: marketplace.domain,
-    // Currency is a property of the marketplace, not of the page markup —
-    // amazon.eg does not label its prices in the HTML.
-    currency: marketplace.currency,
+    // What the page printed wins over the marketplace's own currency, and a
+    // disagreement is preserved rather than corrected — relabelling it would
+    // make the report contradict the source. Falls back to the marketplace when
+    // the page shows no currency at all.
+    currency: resolveCurrency(marketplace.id, currencyToken, marketplace).code,
+    // Provenance for that currency, so a report can tell a value read off the
+    // page from one inferred from the marketplace.
+    // Only the page's own token is passed as evidence. Falling back to
+    // `marketplace.currency` here would hand the resolver the marketplace's
+    // currency as if Amazon had printed it, which reports an inference as a
+    // verified fact — exactly the conflation this provenance exists to avoid.
+    currencyStatus: resolveCurrency(marketplace.id, currencyToken, marketplace).status,
     marketplaceId: marketplace.id,
   };
 }

@@ -86,12 +86,16 @@ test('parseSearchResults returns empty for a page with no results', () => {
 });
 
 test('parseProductDetail extracts the full listing', () => {
-  const product = parseProductDetail(PRODUCT_HTML, 'B0CX23V2ZK');
+  const product = parseProductDetail(PRODUCT_HTML, 'B0CX23V2ZK', getMarketplace('us'));
 
   assert.equal(product.asin, 'B0CX23V2ZK');
   assert.equal(product.title, 'Anker 7-Port USB C Hub with 100W Power Delivery');
   assert.equal(product.brand, 'Anker Store', '"Visit the " prefix is stripped');
-  assert.equal(product.price, '$25.99');
+  // The product price is carried BOTH ways: the verbatim text Amazon printed
+  // and the parsed number. Only the text existed before, which left the numeric
+  // product price blank in every export even when Amazon had plainly shown one.
+  assert.equal(product.priceText, '$25.99');
+  assert.equal(product.price, 25.99);
   assert.equal(product.rating, '4.6 out of 5 stars');
   assert.equal(product.reviewCount, '12,438', '" ratings" suffix is stripped');
   assert.equal(product.availability, 'In Stock');
@@ -100,13 +104,13 @@ test('parseProductDetail extracts the full listing', () => {
 });
 
 test('parseProductDetail filters Amazon sizing boilerplate from features', () => {
-  const { features } = parseProductDetail(PRODUCT_HTML, 'B0CX23V2ZK');
+  const { features } = parseProductDetail(PRODUCT_HTML, 'B0CX23V2ZK', getMarketplace('us'));
   assert.deepEqual(features, ['7-in-1 connectivity', '100W power delivery']);
 });
 
 test('parseProductDetail throws when the page is not a product page', () => {
   assert.throws(
-    () => parseProductDetail('<html><body><p>Sorry, something went wrong.</p></body></html>', 'B0CX23V2ZK'),
+    () => parseProductDetail('<html><body><p>Sorry, something went wrong.</p></body></html>', 'B0CX23V2ZK', getMarketplace('us')),
     /No product page found/,
   );
 });
