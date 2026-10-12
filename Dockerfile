@@ -36,6 +36,10 @@ RUN npm ci --omit=dev --ignore-scripts=false || npm install --omit=dev
 COPY tsconfig.json ./
 COPY src ./src
 COPY public ./public
+# The API applies the schema on boot in multi-user mode, reading
+# ../migrations/001_init.sql relative to dist/. Without this copy the container
+# fails to start with ENOENT the moment DATABASE_URL is set.
+COPY migrations ./migrations
 
 RUN npm run build
 
