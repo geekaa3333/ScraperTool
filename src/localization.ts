@@ -68,6 +68,18 @@ const GLOW_OPENERS = [
   'a#nav-global-location-popover-link',
   '#glow-ingress-block',
 ];
+/**
+ * Country selector Amazon renders when a marketplace ships to countries other
+ * than its own.
+ *
+ * amazon.co.uk shows this as a `France / Germany / Ireland …` dropdown. It MUST
+ * be set before the postcode: typing `75001` straight into the postcode field on
+ * amazon.co.uk is accepted without complaint and then silently ignored — the
+ * header still reads "Deliver to Egypt". Selecting the country first is the only
+ * route that actually moves the destination, which is why a postcode-only
+ * implementation of this module looked like it worked while changing nothing.
+ */
+const GLOW_COUNTRY_LIST = '#GLUXCountryList';
 const GLOW_CITY = '#GLUXCityWithDistrictCityInput';
 const GLOW_CITY_DISTRICT = '#GLUXCityWithDistrict_DistrictInput';
 const GLOW_APPLY = [
@@ -76,6 +88,29 @@ const GLOW_APPLY = [
   'span#GLUXZipUpdate',
   'button[name="glow-ingress-continue-btn"]',
 ];
+
+/**
+ * Outcome of applying the delivery destination.
+ *
+ * `applied` alone is not enough to report: a marketplace can accept a postcode
+ * and discard it, so the reason is kept alongside the boolean and travels into
+ * the scrape result rather than dying in a log line nobody reads.
+ */
+export type DestinationStatus =
+  | 'APPLIED'
+  | 'NOT_OFFERED'
+  | 'NOT_CONFIGURED'
+  | 'NOT_APPLIED'
+  | 'UNVERIFIABLE';
+
+export interface DestinationOutcome {
+  applied: boolean;
+  status: DestinationStatus;
+  /** Destination Amazon's header reported afterwards, when readable. */
+  displayed: string | null;
+  /** Why it failed, when it did. */
+  reason: string | null;
+}
 
 export interface LocalisationResult {
   /** Whether the page ended up serving the marketplace's own currency. */
@@ -86,6 +121,10 @@ export interface LocalisationResult {
   expectedCurrency: string;
   /** True when the destination was applied. False for unverified marketplaces. */
   destinationApplied: boolean;
+  /** Recorded outcome, so a failure is visible downstream and not only logged. */
+  destinationStatus: DestinationStatus;
+  /** Delivery destination Amazon's own header reported after applying. */
+  displayedDestination: string | null;
   /** Currency preference cookie that was set, if any. */
   preferenceCookie: string | null;
   /** What was attempted, for the diagnostic log. */
@@ -138,11 +177,193 @@ export async function applyCurrencyPreference(
  * postal code would be fabricating a customer address to move a price, which is
  * exactly what this is meant to prevent.
  */
+/**
+ * Select the delivery COUNTRY where the marketplace offers such a control.
+ *
+ * Returns true when a country control existed and the selection was made. A
+ * marketplace with no such control (most of them) returns false and proceeds on
+ * postcode alone, which is the correct path for those.
+ */
+/**
+ * Read the destination Amazon currently claims to be delivering to.
+ *
+ * Reads the header control rather than any state we set, so it reflects what
+ * Amazon believes. Returns `null` when the control is absent or unreadable,
+ * which is different from a destination that did not change.
+ */
+export async function readDisplayedDestination(page: Page): Promise<string | null> {
+  /**
+   * Lines that are controls, not destinations.
+   *
+   * The two glow lines swap roles by marketplace. On amazon.co.uk and
+   * amazon.com, line1 is the bare label "Deliver to" and line2 is the place.
+   * On amazon.ae the pair is reversed: line1 is "جارٍ التوصيل إلى Dubai" and
+   * line2 is the button, "تحديث الموقع". Reading a fixed line therefore reports
+   * "Update location" as if it were a destination and fails a working
+   * localisation, so both are read and the first that is not a control wins.
+   */
+  const CONTROL_LABELS =
+    /^(deliver\s*to|update\s*location|choose\s*your\s*location|location|تحديث\s*الموقع|Choose|Update location)$/i;
+  // Amazon often renders the prefix and the button on ONE line, so the line
+  // cannot simply be taken whole: amazon.ae yields
+  // "جارٍ التوصيل إلى Dubai تحديث الموقع" on a single line.
+  const TRAILING_CONTROL =
+    /\s*(?:تحديث\s*الموقع|update\s*location|choose\s*your\s*location)\s*$/i;
+  const LEADING_PREFIX =
+    /^\s*(?:deliver\s*to\s*|جار\S*\s*التوصيل\s*إلى\s*|شحن\s*إلى\s*|\S+\s*إلى\s+)/i;
+
+  try {
+    // `#glow-ingress-line2` holds just the place ("France", "Dubai",
+    // "New York 10001"). The popover link can wrap the whole open modal and
+    // yield "Delivering to Delivering to Dubai Update location".
+    for (const selector of ['#glow-ingress-line2', '#glow-ingress-line1', '#nav-global-location-popover-link']) {
+      const raw = await page.locator(selector).first().innerText({ timeout: 3_000 }).catch(() => null);
+      if (!raw) continue;
+
+      const candidates = raw
+        .split(/\n+/)
+        .map((line) => line.replace(/\s+/g, ' ').trim().replace(TRAILING_CONTROL, '').trim())
+        .map((line) => line.replace(LEADING_PREFIX, '').trim())
+        .filter((line) => line.length > 0 && !CONTROL_LABELS.test(line));
+      if (candidates.length === 0) continue;
+
+      const place = candidates[candidates.length - 1]!;
+      if (place.length > 0) return place;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Confirm the destination Amazon actually ended up with, AFTER a reload.
+ *
+ * Separate from `applyDeliveryDestination` because the header only reflects a
+ * new destination once the page re-renders. Reading it before the reload
+ * compares against a stale value and reports working destinations as failures.
+ */
+export async function verifyDestination(
+  page: Page,
+  marketplace: Marketplace,
+): Promise<DestinationOutcome> {
+  const shown = await readDisplayedDestination(page);
+  if (shown === null) {
+    return {
+      applied: false,
+      status: 'UNVERIFIABLE',
+      displayed: null,
+      reason:
+        `Amazon's delivery header was unreadable, so the ${marketplace.domain} ` +
+        `destination could not be confirmed.`,
+    };
+  }
+  if (!destinationAccepted(shown, marketplace)) {
+    return {
+      applied: false,
+      status: 'NOT_APPLIED',
+      displayed: shown,
+      reason:
+        `Amazon reports delivering to "${shown}" for ${marketplace.domain}, not the ` +
+        `configured ${marketplace.defaultDestination.countryCode} destination.`,
+    };
+  }
+  return { applied: true, status: 'APPLIED', displayed: shown, reason: null };
+}
+
+/**
+ * Whether the header now names a destination in the marketplace's delivery
+ * country.
+ *
+ * Matched on the configured country rather than an exact string, because Amazon
+ * abbreviates ("Deliver to France" vs "Paris 75001"). A mismatch fails the
+ * check: a foreign or unreadable header must never be reported as a verified
+ * destination for another country.
+ */
+function destinationAccepted(shown: string, marketplace: Marketplace): boolean {
+  const destination = marketplace.defaultDestination;
+  const needle = (destination.countryCode ?? '').toLowerCase();
+  const city = (destination.amazonLabel ?? '').toLowerCase();
+
+  // This header names the country, not the ISO code.
+  const countryNames: Record<string, string> = {
+    FR: 'france', GB: 'united kingdom', EG: 'egypt',
+    AE: 'united arab emirates', SA: 'saudi arabia', CA: 'canada', US: 'united states',
+  };
+  const countryName = countryNames[needle] ?? needle;
+
+  const haystack = shown.toLowerCase();
+  if (countryName.length > 2 && haystack.includes(countryName)) return true;
+  if (needle.length === 2 && haystack.includes(needle)) return true;
+  if (city.length > 2 && haystack.includes(city)) return true;
+  return false;
+}
+
+async function applyDeliveryCountry(
+  page: Page,
+  marketplace: Marketplace,
+  log: (message: string) => void = () => undefined,
+): Promise<'applied' | 'no-control' | 'not-offered' | 'failed'> {
+  const countryCode = marketplace.defaultDestination.countryCode;
+
+  // Only relevant when delivering somewhere OTHER than the marketplace's home
+  // country.
+  //
+  // Amazon's country list is the *international* selector: on amazon.com it
+  // offers AU, CA, JP, GB, FR … and deliberately omits the United States
+  // itself. Selecting a marketplace's own country there is impossible by
+  // construction, and treating that as "destination not offered" broke every
+  // same-country marketplace. Nothing needs selecting in that case.
+  if (countryCode === marketplace.countryCode) return 'no-control';
+
+  const select = page.locator(GLOW_COUNTRY_LIST).first();
+  // Most marketplaces have no such control; postcode alone is correct there.
+  if (!(await select.isVisible().catch(() => false))) return 'no-control';
+
+  try {
+    const options = await select
+      .evaluate((el: { options: ArrayLike<{ value: string }> }) =>
+        Array.from(el.options).map((o) => o.value))
+      .catch(() => [] as string[]);
+
+    if (!options.includes(countryCode)) {
+      // A hard stop rather than a fallback. Continuing would type a postcode that
+      // Amazon accepts and discards, and the scrape would then report results
+      // "for France" while actually being UK data — the precise substitution this
+      // module exists to prevent.
+      log(
+        `[localise] ${marketplace.id}: delivery country ${countryCode} is NOT offered by ` +
+          `Amazon's location control (${options.filter(Boolean).length} countries offered, ` +
+          `none of them ${countryCode}). No destination applied and no fallback country used.`,
+      );
+      return 'not-offered';
+    }
+
+    await select.selectOption(countryCode, { timeout: 5_000 });
+    // Amazon re-renders the whole modal after a country change. Holding a
+    // pre-change locator and filling it immediately produced a 30 s actionability
+    // timeout on a live amazon.co.uk page, so the field is re-resolved and given
+    // a moment to attach and become editable.
+    await page
+      .waitForSelector(GLOW_INPUT, { state: 'visible', timeout: 10_000 })
+      .catch(() => undefined);
+    await page.waitForTimeout(600);
+    log(`[localise] ${marketplace.id}: delivery country set to ${countryCode}`);
+    return 'applied';
+  } catch (error) {
+    log(
+      `[localise] ${marketplace.id}: delivery country selection failed — ` +
+        `${String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 160)}`,
+    );
+    return 'failed';
+  }
+}
+
 export async function applyDeliveryDestination(
   page: Page,
   marketplace: Marketplace,
   log: (message: string) => void = () => undefined,
-): Promise<boolean> {
+): Promise<DestinationOutcome> {
   const destination = marketplace.defaultDestination;
   // No postal code means this marketplace has no CONFIGURED destination. Nothing
   // is invented in its place.
@@ -151,7 +372,12 @@ export async function applyDeliveryDestination(
       `[localise] ${marketplace.id}: no verified destination configured ` +
         `(${destination?.label ?? 'none'}) — relying on the currency preference alone`,
     );
-    return false;
+    return {
+      applied: false,
+      status: 'NOT_CONFIGURED',
+      displayed: null,
+      reason: `No verified delivery destination is configured for ${marketplace.domain}.`,
+    };
   }
 
   try {
@@ -167,24 +393,58 @@ export async function applyDeliveryDestination(
       }
     }
 
-    // Pick whichever postcode field this header variant actually renders.
+    // Country first: on amazon.co.uk a postcode typed without this is silently
+    // discarded, leaving the header on its previous country.
+    const country = await applyDeliveryCountry(page, marketplace, log);
+    if (country === 'not-offered') {
+      // Recorded as a localisation failure, never worked around by falling back
+      // to another country.
+      return {
+        applied: false,
+        status: 'NOT_OFFERED',
+        displayed: await readDisplayedDestination(page),
+        reason:
+          `Amazon's location control for ${marketplace.domain} does not offer ` +
+          `${destination.countryCode}, so no delivery destination was applied.`,
+      };
+    }
+
+    // Country first: on amazon.co.uk a postcode typed without this is silently
+    // discarded, leaving the header on its previous country.
+    await applyDeliveryCountry(page, marketplace, log);
+
+    // The postcode narrows the delivery area but is NOT required: on
+    // amazon.co.uk selecting France in the country list already applies France,
+    // and Amazon closes the modal on its own a couple of seconds later. So this
+    // step is best-effort with a short deadline, and its absence is not a
+    // failure — verification after the reload is what decides.
     //
     // `#GLUXZipUpdate` exists on amazon.ca but as a SPAN, not an input, so
     // visibility alone is not enough: a candidate that is visible but not
-    // editable makes `fill` throw. Editability is checked explicitly, and a
-    // visible text input inside the modal is the last resort.
+    // editable makes `fill` throw. Editability is checked explicitly.
     let input = null;
     for (const selector of GLOW_INPUTS) {
       const candidate = page.locator(selector).first();
       const editable = await candidate
-        .evaluate((el: { tagName: string; getAttribute?: (n: string) => string | null }) =>
-          ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) ||
-          el.getAttribute?.('contenteditable') === 'true')
+        .evaluate(
+          (el: { tagName: string; getAttribute?: (n: string) => string | null }) =>
+            ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) ||
+            el.getAttribute?.('contenteditable') === 'true',
+          undefined,
+          { timeout: 4_000 },
+        )
         .catch(() => false);
       if (editable && (await candidate.isVisible().catch(() => false))) {
         input = candidate;
         break;
       }
+    }
+    if (!input) {
+      log(
+        `[localise] ${marketplace.id}: no postcode field available — continuing with the ` +
+          `country selection alone, which Amazon applies on its own.`,
+      );
+      return { applied: true, status: 'APPLIED', displayed: null, reason: null };
     }
     if (!input) {
       // Gulf-market variant: amazon.ae asks for a city and district instead of a
@@ -225,6 +485,12 @@ export async function applyDeliveryDestination(
       }
     }
 
+    // NOT verified here. Amazon's header is stale until the page is reloaded —
+    // on amazon.com it still reads "Deliver to Egypt" immediately after a
+    // correct New York postcode is applied, and only shows "New York 10001"
+    // afterwards. Verifying here reported a working destination as failed, so
+    // verification happens after the reload in `localisePage`.
+
     // The page rewrites itself after the destination is applied. Waiting for
     // that rewrite is what makes a reload afterwards meaningful rather than a
     // race against a half-applied change.
@@ -243,15 +509,15 @@ export async function applyDeliveryDestination(
       )
       .catch(() => undefined);
 
-    return true;
+    // "applied" here means the control was driven. Whether Amazon honoured it is
+    // decided by `verifyDestination` once the page has reloaded.
+    return { applied: true, status: 'APPLIED', displayed: null, reason: null };
   } catch (error) {
     // Logged rather than swallowed: a localisation failure that is silent is
     // indistinguishable from localisation that was never attempted.
-    log(
-      `[localise] ${marketplace.id}: delivery control failed — ` +
-        `${String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 180)}`,
-    );
-    return false;
+    const reason = String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 180);
+    log(`[localise] ${marketplace.id}: delivery control failed — ${reason}`);
+    return { applied: false, status: 'NOT_APPLIED', displayed: null, reason };
   }
 }
 
@@ -274,18 +540,15 @@ export async function localisePage(
   const preferenceCookie = await applyCurrencyPreference(context, marketplace);
   log(`[localise] ${marketplace.id}: currency preference ${preferenceCookie ?? '(unavailable)'}`);
 
-  const destinationApplied = await applyDeliveryDestination(page, marketplace, log);
+  let destination = await applyDeliveryDestination(page, marketplace, log);
   log(
-    `[localise] ${marketplace.id}: destination ${
-      destinationApplied
-        ? `applied (${marketplace.defaultDestination?.postalCode})`
-        : 'not applied (see the reason logged above)'
-    }`,
+    `[localise] ${marketplace.id}: destination ${destination.status} — ` +
+      `${destination.applied ? marketplace.defaultDestination?.postalCode ?? '' : destination.reason ?? ''}`,
   );
 
   // Reload so the price read reflects the settings rather than the page that was
   // already on screen before them.
-  if (destinationApplied || preferenceCookie) {
+  if (destination.applied || preferenceCookie) {
     await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => undefined);
   }
 
@@ -313,22 +576,39 @@ export async function localisePage(
     displayed = await resolve();
   }
 
+  // Confirm the destination only now: the header is authoritative once the page
+  // has reloaded, and nothing earlier proves anything about it.
+  if (destination.applied) {
+    destination = await verifyDestination(page, marketplace);
+    log(
+      `[localise] ${marketplace.id}: destination ${destination.status}` +
+        `${destination.displayed ? ` — Amazon reports "${destination.displayed}"` : ''}` +
+        `${destination.reason && !destination.applied ? ` (${destination.reason})` : ''}`,
+    );
+  }
+
   const ok = displayed === expected;
   log(
     `[localise] ${marketplace.id}: ${ok ? 'ready' : 'CURRENCY MISMATCH'} — ` +
       `expected ${expected}, page displayed ${displayed ?? 'nothing'}`,
   );
 
+  // Currency and delivery are reported separately. A page can be correctly priced
+  // in GBP while the French delivery destination failed to apply, and collapsing
+  // the two would let one silently vouch for the other.
+  const destinationNote = destination.applied
+    ? `Delivering to ${destination.displayed ?? marketplace.defaultDestination?.label ?? 'the configured destination'}.`
+    : `Delivery destination NOT applied (${destination.status}): ${destination.reason}`;
+
   return {
     ok,
     displayedCurrency: displayed,
     expectedCurrency: expected,
-    destinationApplied,
+    destinationApplied: destination.applied,
+    destinationStatus: destination.status,
+    displayedDestination: destination.displayed,
     preferenceCookie,
-    note: ok
-      ? `Serving ${expected} as configured.`
-      : `Amazon served ${displayed ?? 'no recognisable currency'} for ${marketplace.domain} ` +
-        `after localisation. Reported as a mismatch rather than relabelled.`,
+    note: `${ok ? `Serving ${expected} as configured.` : `Amazon served ${displayed ?? 'no recognisable currency'} for ${marketplace.domain} after localisation. Reported as a mismatch rather than relabelled.`} ${destinationNote}`,
   };
 }
 

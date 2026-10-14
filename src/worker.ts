@@ -133,25 +133,37 @@ export const DESTINATIONS: Destination[] = [
   { id: 'giza', label: 'Giza, Egypt', countryCode: 'EG', amazonLabel: 'الجيزة', postalCode: '12511', verified: false },
   { id: 'dubai', label: 'Dubai, UAE', countryCode: 'AE', amazonLabel: 'Dubai', postalCode: '00000', verified: true },
   { id: 'riyadh', label: 'Riyadh, Saudi Arabia', countryCode: 'SA', amazonLabel: 'الرياض', postalCode: '11564', verified: false },
-  { id: 'london', label: 'London, UK', countryCode: 'GB', amazonLabel: 'London', postalCode: 'EC1A', verified: true },
+  { id: 'paris', label: 'Paris, France', countryCode: 'FR', amazonLabel: 'Paris', postalCode: '75001', verified: true },
   { id: 'toronto', label: 'Toronto, Canada', countryCode: 'CA', amazonLabel: 'Toronto', postalCode: 'M5V', verified: true },
   { id: 'newyork', label: 'New York, USA', countryCode: 'US', amazonLabel: 'New York', postalCode: '10001', verified: true },
 ];
 
-/** Destinations valid for a marketplace, i.e. those in the same country. */
+/**
+ * Destinations valid for a marketplace.
+ *
+ * Matched against `deliveryCountryCode`, not `countryCode`. They are the same
+ * for every marketplace except amazon.co.uk, whose research target is France
+ * while its marketplace remains British. Matching on the delivery country keeps
+ * this a genuine same-country rule: Cairo is still refused by amazon.ae.
+ */
 export function destinationsFor(marketplace: Marketplace): Destination[] {
-  return DESTINATIONS.filter((entry) => entry.countryCode === marketplace.countryCode);
+  return DESTINATIONS.filter((entry) => entry.countryCode === marketplace.deliveryCountryCode);
 }
 
 /**
  * Resolve the destination to use for a specific marketplace.
  *
  * Returns `null` when nothing was requested, and `null` when the requested
- * destination belongs to a **different country** than the marketplace. That
- * second case is the bug this function exists to prevent: a single job-level
- * destination id used to be applied to every marketplace, so a batch mixing
- * Egypt and the UAE applied Cairo to the UAE rows and reported delivery
- * estimates computed for the wrong place.
+ * destination belongs to a **different country** than the marketplace's
+ * delivery country. That second case is the bug this function exists to
+ * prevent: a single job-level destination id used to be applied to every
+ * marketplace, so a batch mixing Egypt and the UAE applied Cairo to the UAE rows
+ * and reported delivery estimates computed for the wrong place.
+ *
+ * The comparison is against `deliveryCountryCode`. For amazon.co.uk that is
+ * FR, so a British destination such as London is refused and the configured
+ * French destination is used instead. The marketplace is still recorded as UK
+ * and still priced in GBP; only the delivery country differs.
  *
  * Failing closed to `null` is deliberate. `null` means "Amazon's own default
  * location", which is honest; a mismatched postal code would be a fabricated
@@ -164,7 +176,7 @@ export function destinationForMarketplace(
   if (!destinationId) return null;
   const found = DESTINATIONS.find((entry) => entry.id === destinationId);
   if (!found) return null;
-  if (found.countryCode !== marketplace.countryCode) return null;
+  if (found.countryCode !== marketplace.deliveryCountryCode) return null;
   return found;
 }
 

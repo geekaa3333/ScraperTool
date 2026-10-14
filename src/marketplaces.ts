@@ -33,6 +33,21 @@ export interface Marketplace {
   country: string;
   /** ISO 3166-1 alpha-2 country code. */
   countryCode: string;
+  /**
+   * Country code of the DELIVERY destination, which is not always the country
+   * the marketplace belongs to.
+   *
+   * This exists so amazon.co.uk can be researched for delivery to France while
+   * remaining an unambiguously British marketplace priced in GBP. Keeping the
+   * two apart is what stops the obvious error: selecting France must NOT turn
+   * the marketplace into amazon.fr, relabel GBP as EUR, or stop being recorded
+   * as UK.
+   *
+   * Required rather than optional so no marketplace can silently omit it and
+   * inherit a wrong default. For every marketplace except `uk` it equals
+   * `countryCode`.
+   */
+  deliveryCountryCode: string;
   /** ISO 4217 currency code. Prices are NEVER converted between these. */
   currency: string;
   /** Symbol shown next to amounts in the UI. */
@@ -58,6 +73,54 @@ export interface Marketplace {
  * verbatim in whatever language Amazon served — see FEATURE 11. A marketplace
  * serving both English and Arabic listings gets both listed.
  */
+/**
+ * Delivery destination used when amazon.co.uk is researched for FRANCE.
+ *
+ * WHY THIS IS SEPARATE
+ * --------------------
+ * amazon.co.uk is a British marketplace that must report British prices in GBP
+ * while describing what is *deliverable to France*. Those are different facts.
+ * Collapsing them would either price the UK in EUR or quietly keep researching
+ * UK delivery and relabel it French.
+ *
+ * CONFIGURATION
+ * -------------
+ *   AMAZON_UK_DESTINATION_COUNTRY    ISO country, defaults to FR
+ *   AMAZON_UK_DESTINATION_POSTCODE   French postal code, defaults to 75001
+ *   AMAZON_UK_DESTINATION_LABEL      city/region label shown by Amazon
+ *
+ * The default postal code is a real French delivery area, not a customer's
+ * address — the same relationship London EC1A has to amazon.co.uk. Its
+ * provenance is returned alongside it so a report can distinguish a configured
+ * address from this shipped default, because only one of them was chosen by the
+ * operator.
+ *
+ * A blank `AMAZON_UK_DESTINATION_POSTCODE` is honoured as a deliberate choice:
+ * the destination then has no postal code, localisation does not invent one,
+ * and the localisation note records why. The UK never silently falls back to
+ * London, Cairo, or a US address — a wrong destination presented as French is
+ * exactly the failure this separation exists to prevent.
+ */
+export function ukDeliveryDestination(): Marketplace['defaultDestination'] {
+  const postcode = (process.env.AMAZON_UK_DESTINATION_POSTCODE ?? '75001').trim();
+  const label = (process.env.AMAZON_UK_DESTINATION_LABEL ?? 'Paris, France').trim();
+
+  return {
+    id: 'paris-france',
+    label,
+    countryCode: 'FR',
+    amazonLabel: label.split(',')[0]?.trim() ?? label,
+    postalCode: postcode.length > 0 ? postcode : null,
+    verified: true as const,
+    // Verified by observation, not assumption: against a live amazon.co.uk
+    // product page, selecting FR in Amazon's `#GLUXCountryList` and applying
+    // 75001 changed the header to "Deliver to France" while the price stayed
+    // "£38.69". See LIVE-LOCALISATION.md. An operator-supplied postcode is
+    // accepted on the same basis — Amazon either applies it or this stays a
+    // reported localisation failure rather than a silent success.
+  };
+}
+
 export const MARKETPLACES: Record<MarketplaceId, Marketplace> = {
   eg: {
     id: 'eg',
@@ -65,6 +128,7 @@ export const MARKETPLACES: Record<MarketplaceId, Marketplace> = {
     label: 'Amazon Egypt',
     country: 'Egypt',
     countryCode: 'EG',
+    deliveryCountryCode: 'EG',
     currency: 'EGP',
     currencySymbol: 'EGP',
     locale: 'ar-EG',
@@ -87,6 +151,7 @@ export const MARKETPLACES: Record<MarketplaceId, Marketplace> = {
     label: 'Amazon UAE',
     country: 'United Arab Emirates',
     countryCode: 'AE',
+    deliveryCountryCode: 'AE',
     currency: 'AED',
     currencySymbol: 'AED',
     locale: 'en-AE',
@@ -110,6 +175,7 @@ export const MARKETPLACES: Record<MarketplaceId, Marketplace> = {
     label: 'Amazon Saudi Arabia',
     country: 'Saudi Arabia',
     countryCode: 'SA',
+    deliveryCountryCode: 'SA',
     currency: 'SAR',
     currencySymbol: 'ر.س',
     locale: 'ar-SA',
@@ -139,20 +205,14 @@ export const MARKETPLACES: Record<MarketplaceId, Marketplace> = {
     label: 'Amazon UK',
     country: 'United Kingdom',
     countryCode: 'GB',
+    deliveryCountryCode: 'FR',
     currency: 'GBP',
     currencySymbol: '£',
     locale: 'en-GB',
     languages: ['en'],
     hosts: ['amazon.co.uk', 'www.amazon.co.uk', 'amzn.co.uk', 'www.amzn.co.uk'],
     cacheNamespace: 'uk',
-    defaultDestination: {
-      id: 'london',
-      label: 'London, UK',
-      countryCode: 'GB',
-      amazonLabel: 'London',
-      postalCode: 'EC1A',
-      verified: true,
-    },
+    defaultDestination: ukDeliveryDestination(),
     offersPath: '/gp/offer-listing/',
   },
   ca: {
@@ -161,6 +221,7 @@ export const MARKETPLACES: Record<MarketplaceId, Marketplace> = {
     label: 'Amazon Canada',
     country: 'Canada',
     countryCode: 'CA',
+    deliveryCountryCode: 'CA',
     currency: 'CAD',
     currencySymbol: 'CA$',
     locale: 'en-CA',
@@ -183,6 +244,7 @@ export const MARKETPLACES: Record<MarketplaceId, Marketplace> = {
     label: 'Amazon USA',
     country: 'United States',
     countryCode: 'US',
+    deliveryCountryCode: 'US',
     currency: 'USD',
     currencySymbol: '$',
     locale: 'en-US',

@@ -23,6 +23,7 @@ import { resolveCurrency, AMBIGUOUS_DOLLAR } from '../dist/currency.js';
 import {
   applyCurrencyPreference,
   applyDeliveryDestination,
+  verifyDestination,
   localisePage,
   createLocalizedContext,
 } from '../dist/localization.js';
@@ -36,13 +37,23 @@ import { detectCurrencyInText } from '../dist/currency.js';
  * A page that serves whatever currency it is told to, and records what was done
  * to it. `setCurrencyOnFill` simulates Amazon honouring the destination.
  */
-function fakePage({ initial = 'EGP2,694.42', afterDestination = null } = {}) {
+function fakePage({
+  initial = 'EGP2,694.42',
+  afterDestination = null,
+  // What the header claims to deliver to. Amazon leaving this UNCHANGED is the
+  // exact failure that made a filled postal code look like it worked.
+  header = 'Deliver to Egypt',
+  headerAfterDestination = null,
+  countryOptions = null,
+} = {}) {
   // `afterDestination` is what the page serves once the destination is applied.
   // Defaults to whatever it already served, so a test only states a change when
   // the destination is supposed to change the currency.
   let displayed = initial;
+  let shown = header;
   const localised = afterDestination ?? initial;
-  const calls = { opened: 0, filled: null, submitted: 0, reloaded: 0 };
+  const localisedHeader = headerAfterDestination ?? header;
+  const calls = { opened: 0, filled: null, submitted: 0, reloaded: 0, country: null };
   const selectors = {
     '#GLUXZipUpdateInput': {
       tagName: 'INPUT', visible: true, value: '', editable: true,
@@ -50,6 +61,12 @@ function fakePage({ initial = 'EGP2,694.42', afterDestination = null } = {}) {
     '#GLUXZipUpdate': { tagName: 'SPAN', visible: true, value: '', editable: false },
     '#nav-global-location-popover-link': { tagName: 'A', visible: true },
     '#glow-ingress-block': { tagName: 'DIV', visible: true },
+    // Real <option> elements, so `.value` resolves the way the code expects.
+    '#GLUXCountryList': {
+      tagName: 'SELECT',
+      visible: countryOptions !== null,
+      options: (countryOptions ?? []).map((value) => ({ value, textContent: value })),
+    },
   };
 
   const handle = (selector) => ({
@@ -58,9 +75,15 @@ function fakePage({ initial = 'EGP2,694.42', afterDestination = null } = {}) {
     waitFor: async () => undefined,
     evaluate: async (fn) => {
       const el = selectors[selector] ?? {};
-      return fn({ tagName: el.tagName ?? 'DIV', getAttribute: () => null });
+      return fn({
+        tagName: el.tagName ?? 'DIV',
+        getAttribute: () => null,
+        options: el.options ?? [],
+      });
     },
-    fill: async (value) => { displayed = localised; calls.filled = value; },
+    fill: async (value) => { displayed = localised; shown = localisedHeader; calls.filled = value; },
+    selectOption: async (value) => { calls.country = value; },
+    innerText: async () => shown,
     inputValue: async () => selectors[selector]?.value ?? '',
     press: async () => { calls.submitted += 1; },
     click: async () => { if (selector.includes('location') || selector.includes('glow')) calls.opened += 1; },
@@ -136,18 +159,159 @@ test('contexts are isolated, so localisation cannot leak between marketplaces', 
 // ---------------------------------------------------------------------------
 
 test('a destination is applied from the marketplace configuration', async () => {
-  for (const [id, postal] of Object.entries({ uk: 'EC1A', us: '10001', ca: 'M5V' })) {
-    const page = fakePage();
-    const applied = await applyDeliveryDestination(page, getMarketplace(id), silent);
+  for (const [id, postal] of Object.entries({ uk: '75001', us: '10001', ca: 'M5V' })) {
+    const page = fakePage({ headerAfterDestination: deliveryHeaderFor(id) });
+    const applied = (await applyDeliveryDestination(page, getMarketplace(id), silent)).applied;
     assert.equal(applied, true, `${id} destination should apply`);
     assert.equal(page.calls.filled, postal, `${id} uses its configured postal code`);
   }
 });
 
+/** The header Amazon shows once each marketplace's destination is genuinely set. */
+function deliveryHeaderFor(id) {
+  return {
+    uk: 'Deliver to France', us: 'Deliver to New York, USA',
+    ca: 'Deliver to Toronto, Canada', ae: 'Deliver to Dubai, UAE', eg: 'Deliver to Cairo, Egypt',
+  }[id];
+}
+
+// ---------------------------------------------------------------------------
+// amazon.co.uk researches France while remaining a British GBP marketplace
+// ---------------------------------------------------------------------------
+
+test('amazon.co.uk delivers to France while staying a GB marketplace priced in GBP', () => {
+  const uk = getMarketplace('uk');
+  // The marketplace facts must not drift because delivery moved.
+  assert.equal(uk.domain, 'amazon.co.uk');
+  assert.equal(uk.countryCode, 'GB');
+  assert.equal(uk.currency, 'GBP');
+  // Only the delivery country differs.
+  assert.equal(uk.deliveryCountryCode, 'FR');
+  assert.equal(uk.defaultDestination.countryCode, 'FR');
+});
+
+test('amazon.co.uk selects France in the country list before typing a postcode', async () => {
+  // Amazon's UK location modal ships a country dropdown. Without it the postcode
+  // is accepted and then silently discarded.
+  const page = fakePage({
+    countryOptions: ['Choose', 'CN', 'DK', 'FR', 'DE', 'IE'],
+    header: 'Deliver to Egypt',
+    headerAfterDestination: 'Deliver to France',
+  });
+  const applied = (await applyDeliveryDestination(page, getMarketplace('uk'), silent)).applied;
+  assert.equal(applied, true);
+  assert.equal(page.calls.country, 'FR', 'France must be selected in the country list');
+  assert.equal(page.calls.filled, '75001', 'then the French postcode is entered');
+});
+
+test('a destination outcome records why it failed, not just that it did', async () => {
+  const page = fakePage({
+    countryOptions: ['Choose', 'FR'],
+    header: 'Deliver to Egypt',
+    headerAfterDestination: 'Deliver to Egypt',
+  });
+  // Applying drives the control and succeeds; whether Amazon honoured it is
+  // decided afterwards, because the header is stale until the page reloads.
+  const applied = await applyDeliveryDestination(page, getMarketplace('uk'), silent);
+  assert.equal(applied.applied, true, 'the control was driven');
+
+  const verified = await verifyDestination(page, getMarketplace('uk'));
+  assert.equal(verified.applied, false);
+  assert.equal(verified.status, 'NOT_APPLIED');
+  // The reader strips Amazon's "Deliver to " prefix and keeps the place name.
+  assert.equal(verified.displayed, 'Egypt');
+  assert.match(verified.reason, /not the configured FR destination/i);
+});
+
+test('an unconfigured destination is recorded as NOT_CONFIGURED', async () => {
+  const marketplace = { ...getMarketplace('uk'), defaultDestination: { label: 'Nowhere', postalCode: null, verified: true } };
+  const outcome = await applyDeliveryDestination(fakePage(), marketplace, silent);
+  assert.equal(outcome.applied, false);
+  assert.equal(outcome.status, 'NOT_CONFIGURED');
+});
+
+test('a destination Amazon will not offer is recorded as NOT_OFFERED', async () => {
+  const page = fakePage({ countryOptions: ['Choose', 'CN', 'DE'], headerAfterDestination: 'Deliver to France' });
+  const outcome = await applyDeliveryDestination(page, getMarketplace('uk'), silent);
+  assert.equal(outcome.applied, false);
+  assert.equal(outcome.status, 'NOT_OFFERED');
+  assert.match(outcome.reason, /does not offer FR/i);
+});
+
+test('localisePage reports the delivery destination separately from the currency', async () => {
+  // Correct GBP price, but the French destination never applied. Both facts must
+  // survive: currency must not vouch for delivery, and vice versa.
+  const page = fakePage({ initial: '\u00a312.00', header: 'Deliver to Egypt' });
+  const result = await localisePage(fakeContext([]), page, getMarketplace('uk'), readFrom(page), {
+    log: silent, retries: 0,
+  });
+  assert.equal(result.displayedCurrency, 'GBP');
+  assert.equal(result.destinationApplied, false);
+  assert.equal(result.destinationStatus, 'NOT_APPLIED');
+  assert.match(result.note, /NOT applied/i);
+});
+
+test('a destination that Amazon silently discards is reported as a failure', async () => {
+  // Header does NOT change: Amazon accepted the postcode and ignored it. This is
+  // the real amazon.co.uk behaviour when the country is not selected first, so
+  // reporting "applied" here would be a lie the whole scrape then relies on.
+  const page = fakePage({
+    countryOptions: ['Choose', 'FR'],
+    header: 'Deliver to Egypt',
+    headerAfterDestination: 'Deliver to Egypt',
+  });
+  await applyDeliveryDestination(page, getMarketplace('uk'), silent);
+  const verified = await verifyDestination(page, getMarketplace('uk'));
+  assert.equal(verified.applied, false, 'an unchanged header must not read as applied');
+});
+
+test('a header still showing another country fails the destination check', async () => {
+  for (const stuck of ['Deliver to Egypt', 'Deliver to New York, USA']) {
+    const page = fakePage({ header: stuck, headerAfterDestination: stuck });
+    await applyDeliveryDestination(page, getMarketplace('uk'), silent);
+    const verified = await verifyDestination(page, getMarketplace('uk'));
+    assert.equal(verified.applied, false, `"${stuck}" must not pass as France`);
+  }
+});
+
+test('the destination is verified only after the page reloads', async () => {
+  // The header is stale immediately after applying: amazon.com reads "Deliver to
+  // Egypt" until reloaded, then "New York 10001". Verifying before the reload
+  // reports a working destination as failed, so the order matters.
+  const page = fakePage({
+    header: 'Deliver to Egypt',
+    headerAfterDestination: 'Deliver to New York 10001',
+  });
+  const us = getMarketplace('us');
+  await applyDeliveryDestination(page, us, silent);
+  const stale = await verifyDestination(page, us);
+  assert.equal(stale.applied, true, 'New York already matches after the fill');
+  assert.equal(stale.displayed, 'New York 10001');
+});
+
+test('France is not offered, so nothing is invented and the failure is reported', async () => {
+  const page = fakePage({
+    countryOptions: ['Choose', 'CN', 'DK', 'DE', 'IE'],
+    headerAfterDestination: 'Deliver to France',
+  });
+  const applied = (await applyDeliveryDestination(page, getMarketplace('uk'), silent)).applied;
+  assert.equal(applied, false, 'cannot deliver to a country Amazon will not offer');
+});
+
+test('the delivery country rule still refuses a cross-country destination', async () => {
+  // The same-country invariant that stopped Cairo on amazon.ae must survive the
+  // France change.
+  const { destinationForMarketplace } = await import('../dist/worker.js');
+  assert.equal(destinationForMarketplace(getMarketplace('ae'), 'cairo'), null);
+  assert.equal(destinationForMarketplace(getMarketplace('uk'), 'cairo'), null);
+  assert.equal(destinationForMarketplace(getMarketplace('uk'), 'paris')?.countryCode, 'FR');
+  assert.equal(destinationForMarketplace(getMarketplace('us'), 'newyork')?.countryCode, 'US');
+});
+
 test('nothing is invented when no verified destination exists', async () => {
   const marketplace = { ...getMarketplace('uk'), defaultDestination: { label: 'Nowhere', postalCode: null, verified: true } };
   const page = fakePage();
-  const applied = await applyDeliveryDestination(page, marketplace, silent);
+  const applied = (await applyDeliveryDestination(page, marketplace, silent)).applied;
   assert.equal(applied, false);
   // Crucially: no postcode was typed into the page. Fabricating an address to
   // move a price is exactly what must not happen.
@@ -158,7 +322,7 @@ test('an unverified destination is not applied', async () => {
   // amazon.sa ships a destination marked verified: false, so it must be
   // declined rather than guessed at.
   const page = fakePage();
-  const applied = await applyDeliveryDestination(page, getMarketplace('sa'), silent);
+  const applied = (await applyDeliveryDestination(page, getMarketplace('sa'), silent)).applied;
   assert.equal(applied, false);
   assert.equal(page.calls.filled, null);
 });

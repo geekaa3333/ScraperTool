@@ -180,16 +180,24 @@ test('destinations are filtered per marketplace country', () => {
     'giza',
   ]);
   assert.deepEqual(destinationsFor(getMarketplace('ae')).map((d) => d.id), ['dubai']);
-  assert.deepEqual(destinationsFor(getMarketplace('uk')).map((d) => d.id), ['london']);
+  // amazon.co.uk researches France, so France is the only destination it offers.
+  assert.deepEqual(destinationsFor(getMarketplace('uk')).map((d) => d.id), ['paris']);
   assert.deepEqual(destinationsFor(getMarketplace('ca')).map((d) => d.id), ['toronto']);
   assert.deepEqual(destinationsFor(getMarketplace('us')).map((d) => d.id), ['newyork']);
 });
 
-test('no marketplace offers another country\'s destinations', () => {
-  for (const id of ['ae', 'uk', 'ca', 'us']) {
+test('no marketplace offers another delivery country\'s destinations', () => {
+  // Checked against the DELIVERY country, not the marketplace country: amazon.co.uk
+  // is a GB marketplace whose delivery country is FR, and must therefore offer
+  // only French destinations — never Cairo, never London.
+  for (const id of ['ae', 'uk', 'ca', 'us', 'eg']) {
     const mp = getMarketplace(id);
     for (const destination of destinationsFor(mp)) {
-      assert.equal(destination.countryCode, mp.countryCode);
+      assert.equal(
+        destination.countryCode,
+        mp.deliveryCountryCode,
+        `${id} offered ${destination.id} from the wrong delivery country`,
+      );
     }
   }
 });

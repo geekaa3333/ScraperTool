@@ -130,7 +130,7 @@ test('Saudi has its own destination namespace', () => {
   const saDestinations = destinationsFor(SA).map((d) => d.id);
   assert.ok(saDestinations.includes('riyadh'));
   // No other market's destinations may be offered on amazon.sa.
-  for (const id of ['cairo', 'dubai', 'london', 'toronto', 'newyork']) {
+  for (const id of ['cairo', 'dubai', 'paris', 'toronto', 'newyork']) {
     assert.ok(!saDestinations.includes(id), `${id} must not be offered on amazon.sa`);
   }
 });
