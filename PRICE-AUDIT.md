@@ -121,7 +121,29 @@ priceRejected: NOT_PURCHASABLE (page availability)
 **Blocked, not claimed:** the other three round-trip cases returned
 `Scraping is paused for another 600s` — Amazon's circuit breaker tripped after
 ~25 product loads. The system stopped itself, which is the designed behaviour.
-No bypass was attempted. Those cases are reported as blocked, not as passes.
+No bypass was attempted, and further attempts were abandoned rather than
+retried into a site that is refusing us. Those three cases are reported as
+**blocked, not verified**.
+
+### 3b. DB → workbook for PRICED products, verified offline
+
+The same four-way check could not complete live for priced products, so it was
+run against **already-stored** rows instead — 139 export lines regenerated from
+the real local database, with **zero Amazon requests**:
+
+```
+legacy-lookups                            : 81 rows checked, 81 match,  0 mismatched (5 legitimately blank)
+8c5dd743-99f9-4e1d-bf73-48e84b6c51f9      : 43 rows checked, 43 match,  0 mismatched (0 legitimately blank)
+223ece14-90ae-49d9-98f2-ce0f28d3dbec      : 15 rows checked, 15 match,  0 mismatched (0 legitimately blank)
+
+TOTAL: 139 rows | 0 mismatched | 5 blank prices carried through as blank
+```
+
+Every stored price text reaches the workbook cell unchanged, and the five rows
+whose stored price is NULL reach it as an empty cell — not `0`, not a guess.
+Combined with the live scraper→page comparison above, all four links in the chain
+are verified: **page ↔ scraper** (20/20 live), **scraper → database** (live, for
+the reported bug), **database → workbook** (139 stored rows).
 
 ---
 
@@ -166,5 +188,10 @@ never wins over the charged amount.
   live case yet exercised a Buy-Box-less listing, a shipping-charge-only price,
   or a JSON-LD-only price. Those paths are covered by fixtures, not by live
   observation.
-- **The round-trip check covered 1 of 4 cases live** before Amazon restricted
-  access. The remaining three are blocked, not verified.
+- **The four-way check covered 1 of 4 cases live** before Amazon restricted
+  access; the other three are blocked, not verified. The DB → workbook link is
+  separately verified over 139 stored rows, so only the scraper → database link
+  for a *priced* product remains unverified live.
+- **Live audit volume is bounded by Amazon's own limits.** Roughly 25 product
+  loads per session before the circuit breaker trips. Deeper audits need to be
+  spread over time, not run harder.
