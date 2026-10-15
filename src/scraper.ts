@@ -3,6 +3,7 @@ import { chromium } from 'playwright';
 import * as cheerio from 'cheerio';
 import { parsePrice, parsePriceInDisplayedCurrency } from './offers.js';
 import { classifyPageState, readPageMessages } from './page-state.js';
+import { readProductPrice, isPurchasable } from './price-source.js';
 import { detectCurrencyInText, resolveCurrency } from './currency.js';
 import type { ProductDetail, SearchProduct } from './types.js';
 import {
@@ -353,19 +354,25 @@ export function parseProductDetail(
   // silently corrected.
   // Read once and reused: the displayed price text drives both the numeric
   // amount and the currency, and they must never be read from different sources.
-  const priceText = pickText($, [
-    '#corePriceDisplay_desktop_feature_div .a-offscreen',
-    '#corePrice_feature_div .a-offscreen',
-    '#price_inside_buybox',
-    '#priceblock_ourprice',
-    '#priceblock_dealprice',
-    '.a-price .a-offscreen',
-  ]);
+  // The active selling price, from a scoped source hierarchy.
+  //
+  // This replaces a selector chain that ended in `.a-price .a-offscreen`, a
+  // PAGE-WIDE selector. When the product had no price of its own, every scoped
+  // selector returned nothing and that one matched fifteen elements inside
+  // recommendation carousels — so a DIFFERENT PRODUCT'S price was recorded as
+  // this product's, and reported as EXTRACTED. See src/price-source.ts.
+  //
+  // `available` gates the result: a page stating "Currently unavailable" has no
+  // current selling price, whatever else it renders. Seller-offer prices are
+  // unaffected and remain valid per seller.
+  const purchasable = isPurchasable(messages.availabilityStatus);
+  const priceReading = readProductPrice($, marketplace, purchasable);
+
+  const priceText = priceReading.text;
 
   const currencyToken = detectCurrencyInText(priceText);
 
-  const productPrice =
-    parsePrice(priceText, marketplace) ?? parsePriceInDisplayedCurrency(priceText);
+  const productPrice = priceReading.amount;
 
   return {
     asin,
@@ -373,16 +380,9 @@ export function parseProductDetail(
     url: buildProductUrl(marketplace, asin),
     brand,
     // Stored both ways: verbatim text for display, parsed number so Excel can
-    // sort and sum. Only the text was kept before, which left the numeric
-    // product price permanently blank in every export.
-    priceText: pickText($, [
-      '#corePriceDisplay_desktop_feature_div .a-offscreen',
-      '#corePrice_feature_div .a-offscreen',
-      '#price_inside_buybox',
-      '#priceblock_ourprice',
-      '#priceblock_dealprice',
-      '.a-price .a-offscreen',
-    ]),
+    // sort and sum. Read from the SAME reading as `price` above, so the text and
+    // the number can never describe different things.
+    priceText,
     // Marketplace-scoped first. Only if that yields nothing AND the page
     // printed a recognised foreign currency do we take the amount on the
     // currency's own terms — a UK page showing "EGP2,694.42" really is 2694.42
@@ -416,7 +416,18 @@ export function parseProductDetail(
         : 'PARSING_FAILED'
       : messages.selectionRequired
         ? 'VARIATION_REQUIRED'
-        : 'NOT_AVAILABLE_IN_SOURCE',
+        : !purchasable
+          // The product has no current selling price. That is a fact about the
+          // page, not a failed extraction, and the report must say so.
+          ? 'NOT_AVAILABLE_IN_SOURCE'
+          : 'NOT_AVAILABLE_IN_SOURCE',
+    // Provenance, so a wrong price can be diagnosed after the fact.
+    priceSource: priceReading.source,
+    priceSelector: priceReading.selector,
+    priceBasisPriceOnly: priceReading.basisPriceOnly,
+    priceRejected: priceReading.rejected.map(
+      (entry) => `${entry.reason}${entry.value ? `: ${entry.value}` : ''} (${entry.where})`,
+    ),
     pageState: pageState.state,
     pageStateReason: pageState.reason,
     requestedAsin: asin,

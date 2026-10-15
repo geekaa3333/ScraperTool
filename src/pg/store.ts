@@ -1082,9 +1082,12 @@ export class PostgresStore implements DataStore {
                                        selection_required, selection_types, price_status,
                                        page_state, page_state_reason,
                                        requested_asin, variation_asin, variation_attributes,
-                                       variation_note, variations_complete, buying_options_opened)
+                                       variation_note, variations_complete, buying_options_opened,
+                                       price_source, price_selector, price_basis_only,
+                                       price_rejected)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,
-               $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39)
+               $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,
+               $40,$41,$42,$43)
        RETURNING snapshot_id`,
       [
         userId, jobId,
@@ -1124,6 +1127,11 @@ export class PostgresStore implements DataStore {
         (product.variationNote as string) ?? null,
         product.variationsComplete === undefined ? null : Boolean(product.variationsComplete),
         product.buyingOptionsOpened === undefined ? null : Boolean(product.buyingOptionsOpened),
+        // Price provenance, so a wrong price can be traced to a source.
+        (product.priceSource as string) ?? null,
+        (product.priceSelector as string) ?? null,
+        product.priceBasisPriceOnly === undefined ? null : Boolean(product.priceBasisPriceOnly),
+        JSON.stringify(product.priceRejected ?? []),
       ],
     );
     const snapshotId = first(rows, 'saveResult').snapshot_id;
@@ -1284,6 +1292,10 @@ export class PostgresStore implements DataStore {
         variationNote: snapshot.variation_note ?? null,
         variationsComplete: snapshot.variations_complete ?? null,
         buyingOptionsOpened: snapshot.buying_options_opened ?? null,
+        priceSource: snapshot.price_source ?? null,
+        priceSelector: snapshot.price_selector ?? null,
+        priceBasisPriceOnly: snapshot.price_basis_only ?? null,
+        priceRejected: safeJson(snapshot.price_rejected, []),
         offersTotalCount: num(snapshot.offers_total_count),
         scrapedAt: String(snapshot.scraped_at),
         destination: safeJson(snapshot.destination, null),

@@ -253,6 +253,13 @@ export class SqliteStore implements DataStore {
       ['product_snapshots', 'variation_note', 'TEXT'],
       ['product_snapshots', 'variations_complete', 'INTEGER'],
       ['product_snapshots', 'buying_options_opened', 'INTEGER'],
+      // Price provenance. Nullable with no default: a historical row reads NULL,
+      // meaning "this price was not attributed to a source", never "it came from
+      // somewhere reliable".
+      ['product_snapshots', 'price_source', 'TEXT'],
+      ['product_snapshots', 'price_selector', 'TEXT'],
+      ['product_snapshots', 'price_basis_only', 'INTEGER'],
+      ['product_snapshots', 'price_rejected_json', 'TEXT'],
     ];
 
     for (const [table, column, type] of columns) {
@@ -1231,9 +1238,11 @@ export class SqliteStore implements DataStore {
                                            selection_required, selection_types_json, price_status,
                                            page_state, page_state_reason,
                                            requested_asin, variation_asin, variation_attributes_json,
-                                           variation_note, variations_complete, buying_options_opened)
+                                           variation_note, variations_complete, buying_options_opened,
+                                           price_source, price_selector, price_basis_only,
+                                           price_rejected_json)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                                                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT (job_id, marketplace_id, asin) DO UPDATE SET
              title = excluded.title,
              brand = excluded.brand,
@@ -1270,7 +1279,11 @@ export class SqliteStore implements DataStore {
              variation_attributes_json = excluded.variation_attributes_json,
              variation_note = excluded.variation_note,
              variations_complete = excluded.variations_complete,
-             buying_options_opened = excluded.buying_options_opened`,
+             buying_options_opened = excluded.buying_options_opened,
+             price_source = excluded.price_source,
+             price_selector = excluded.price_selector,
+             price_basis_only = excluded.price_basis_only,
+             price_rejected_json = excluded.price_rejected_json`,
         )
         .run(
           snapshotId,
@@ -1318,6 +1331,10 @@ export class SqliteStore implements DataStore {
           // retroactively claimed as fully explored.
           product.variationsComplete === undefined ? null : boolInt(product.variationsComplete),
           product.buyingOptionsOpened === undefined ? null : boolInt(product.buyingOptionsOpened),
+          (product.priceSource as string) ?? null,
+          (product.priceSelector as string) ?? null,
+          product.priceBasisPriceOnly === undefined ? null : boolInt(product.priceBasisPriceOnly),
+          json(product.priceRejected ?? []),
         );
 
       // ON CONFLICT DO UPDATE assigns to `excluded.snapshot_id`, so the id is

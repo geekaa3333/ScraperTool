@@ -82,6 +82,19 @@ export interface ExportRow {
   buyingOptionsMessage: string | null;
   /** Why the price is absent, or EXTRACTED when present. */
   priceMissingReason: string | null;
+  /**
+   * Where the price came from, so a reader can judge it without re-scraping.
+   *
+   * `NONE` means no price was reported. That is a materially different claim
+   * from any named source, and the column exists so the two cannot be confused.
+   */
+  priceSource: string | null;
+  /** The selector that produced the price. */
+  priceSelector: string | null;
+  /** True when the only price on the page was a struck-through list price. */
+  priceBasisOnly: boolean | null;
+  /** Prices found and refused, each with its reason. */
+  priceRejected: string | null;
   /** What kind of page Amazon served. */
   pageStatus: string | null;
   /** Why that classification was reached, in words. */
@@ -186,6 +199,10 @@ export const EXPORT_COLUMNS: Column[] = [
   { key: 'priceWarning', header: 'Price Warning', width: 34 },
   { key: 'buyingOptionsMessage', header: 'Buying Options Status', width: 28 },
   { key: 'priceMissingReason', header: 'Price Missing Reason', width: 24 },
+  { key: 'priceSource', header: 'Price Source', width: 16 },
+  { key: 'priceSelector', header: 'Price Selector', width: 44 },
+  { key: 'priceBasisOnly', header: 'List Price Only', width: 15 },
+  { key: 'priceRejected', header: 'Prices Rejected (and why)', width: 52 },
   { key: 'pageStatus', header: 'Page Status', width: 20 },
   { key: 'pageMessage', header: 'Page Message', width: 46 },
   { key: 'extractionStatus', header: 'Extraction Status', width: 22 },
@@ -426,6 +443,10 @@ function pageMessageFields(product: {
   priceWarning?: string | null;
   buyingOptionsMessage?: string | null;
   priceStatus?: string | null;
+  priceSource?: string | null;
+  priceSelector?: string | null;
+  priceBasisPriceOnly?: boolean | null;
+  priceRejected?: string[] | null;
   pageState?: string | null;
   pageStateReason?: string | null;
   offersComplete?: boolean;
@@ -438,6 +459,13 @@ function pageMessageFields(product: {
     priceWarning: product.priceWarning ?? null,
     buyingOptionsMessage: product.buyingOptionsMessage ?? null,
     priceMissingReason: product.priceStatus ?? null,
+    priceSource: product.priceSource ?? 'NONE',
+    priceSelector: product.priceSelector ?? null,
+    priceBasisOnly: product.priceBasisPriceOnly ?? null,
+    priceRejected:
+      Array.isArray(product.priceRejected) && product.priceRejected.length > 0
+        ? product.priceRejected.join(' | ')
+        : null,
     pageStatus: product.pageState ?? 'UNKNOWN',
     pageMessage: product.pageStateReason ?? null,
     // A product that produced a price or a real availability answer is an
@@ -529,6 +557,11 @@ export function failedRow(
     priceWarning: null,
     buyingOptionsMessage: null,
     priceMissingReason: null,
+    // No page was read, so no price has a source.
+    priceSource: 'NONE',
+    priceSelector: null,
+    priceBasisOnly: null,
+    priceRejected: null,
     pageStatus: status === 'NOT_FOUND' ? 'NOT_FOUND' : 'UNKNOWN',
     pageMessage: null,
     extractionStatus: status,

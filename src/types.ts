@@ -107,6 +107,26 @@ export interface ProductDetail extends Omit<SearchProduct, 'price'> {
   /** How `currency` was established, so an inference is not read as a fact. */
   currencyStatus: string | null;
   /**
+   * Which section of the page the price was read from.
+   *
+   * Without this a wrong price cannot be diagnosed after the fact. `NONE` means
+   * no price was reported, which is a different statement from any of the
+   * sources below.
+   */
+  priceSource?: string | null;
+  /** The selector that produced the price, for diagnosis. */
+  priceSelector?: string | null;
+  /** True when the only price the page rendered was a struck-through list price. */
+  priceBasisPriceOnly?: boolean | null;
+  /**
+   * Every price found and deliberately NOT used, each with its reason.
+   *
+   * This is what turns a blank cell into a diagnosable one: a reader can see
+   * that a price existed and was refused for being a list price, a related
+   * product, or a range.
+   */
+  priceRejected?: string[];
+  /**
    * What localisation did before this price was read.
    *
    * Diagnostic only. It records whether the delivery destination and currency
