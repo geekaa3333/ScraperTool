@@ -2,6 +2,7 @@ import type { Browser, Page } from 'playwright';
 import { chromium } from 'playwright';
 import * as cheerio from 'cheerio';
 import { parsePrice, parsePriceInDisplayedCurrency } from './offers.js';
+import { classifyPageState, readPageMessages } from './page-state.js';
 import { detectCurrencyInText, resolveCurrency } from './currency.js';
 import type { ProductDetail, SearchProduct } from './types.js';
 import {
@@ -268,13 +269,32 @@ export function parseProductDetail(
 ): ProductDetail {
   const $ = cheerio.load(html);
 
+  // Strip inline scripts and styles before ANY text is read. Amazon inlines an
+  // AOD loader script inside #availability itself, so reading that element first
+  // and cleaning later returned JavaScript source as the product's availability
+  // message ("!logAssetsNotLoadedState.isAodAssetsNotLoadedLogged)) { A.state(…").
+  $('script, style, noscript').remove();
+
+  // Classify the page BEFORE parsing it.
+  //
+  // Previously a missing title produced one generic error, so a deleted listing,
+  // an Amazon error page and a CAPTCHA were indistinguishable and all became
+  // FAILED. The state is carried on the result so the report can say which it
+  // was — and, critically, so a CAPTCHA is never recorded as a product that does
+  // not exist.
+  const pageState = classifyPageState(html);
+
   // The title is the one field whose absence means this is not a product page.
   const title = pickText($, ['#productTitle', '#title span', 'h1#title']);
   if (!title) {
-    throw new AmazonScraperError(
+    const error = new AmazonScraperError(
       `No product page found for ASIN ${asin}`,
-      'The page may be unavailable in this marketplace, or Amazon served a different layout.',
+      pageState.reason ??
+        'The page may be unavailable in this marketplace, or Amazon served a different layout.',
     );
+    // Carried so the caller can record the classification instead of guessing.
+    Object.assign(error, { pageState: pageState.state, pageStateReason: pageState.reason });
+    throw error;
   }
 
   // Amazon phrases brand lines differently per marketplace ("Visit the X Store",
@@ -310,6 +330,24 @@ export function parseProductDetail(
 
   const availability = clean(pickText($, ['#availability span', '#availability', '#outOfStock .a-color-price']));
 
+  // Read what the page SAID, not just whether a price exists.
+  //
+  // `#availability` alone misses the shipping-provenance and price-warning lines
+  // that sit outside it, and it is absent entirely on pages where Amazon asks for
+  // a variation first. The whole visible body is read so those messages are not
+  // lost, then classified. Every message is kept verbatim.
+  const messageSource =
+    [
+      availability,
+      pickText($, ['#shippingMessage', '#mir-layout-DELIVERY_BLOCK span', '#deliveryBlockMessage']),
+      pickText($, ['#price-block-deal-message', '#price', '.price-block .a-text-price']),
+      pickText($, ['#buybox-see-all-buying-choices', '#aod-ingress-link']),
+    ]
+      .filter(Boolean)
+      .join(' \n ') || $('body').text();
+
+  const messages = readPageMessages(messageSource);
+
   // Whatever currency the page actually printed, read before falling back to the
   // marketplace's own. This is what lets a genuine mismatch be flagged instead of
   // silently corrected.
@@ -325,6 +363,9 @@ export function parseProductDetail(
   ]);
 
   const currencyToken = detectCurrencyInText(priceText);
+
+  const productPrice =
+    parsePrice(priceText, marketplace) ?? parsePriceInDisplayedCurrency(priceText);
 
   return {
     asin,
@@ -347,8 +388,7 @@ export function parseProductDetail(
     // currency's own terms — a UK page showing "EGP2,694.42" really is 2694.42
     // EGP, and blanking it would throw away a price Amazon plainly printed.
     // The currency below records EGP and flags the mismatch.
-    price:
-      parsePrice(priceText, marketplace) ?? parsePriceInDisplayedCurrency(priceText),
+    price: productPrice,
     rating: pickText($, [
       '#acrPopover .a-icon-alt',
       'span[data-hook="rating-out-of-text"]',
@@ -356,6 +396,34 @@ export function parseProductDetail(
     ]),
     reviewCount,
     availability,
+    // What Amazon stated, classified. `availability` stays as the raw string so
+    // nothing that used it is silently changed by this addition.
+    availabilityStatus: messages.availabilityStatus,
+    availabilityMessage: messages.availabilityMessage ?? availability,
+    shippingMessage: messages.shippingMessage,
+    priceWarning: messages.priceWarning,
+    buyingOptionsMessage: messages.buyingOptionsMessage,
+    pageMessages: messages.allMessages,
+    selectionRequired: messages.selectionRequired,
+    selectionTypes: messages.selectionTypes,
+    // Why the price is present or absent. Distinct cases, because they call for
+    // different follow-up: a missing price because Amazon showed none is a fact
+    // about the source, whereas a price that WAS printed and could not be read
+    // is an extraction bug and must not hide behind a plausible blank.
+    priceStatus: priceText
+      ? productPrice != null
+        ? 'EXTRACTED'
+        : 'PARSING_FAILED'
+      : messages.selectionRequired
+        ? 'VARIATION_REQUIRED'
+        : 'NOT_AVAILABLE_IN_SOURCE',
+    pageState: pageState.state,
+    pageStateReason: pageState.reason,
+    requestedAsin: asin,
+    variationAsin: null,
+    variationAttributes: null,
+    variationNote: null,
+    variationsComplete: true,
     features,
     description: pickText($, [
       '#productDescription',

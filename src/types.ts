@@ -55,6 +55,39 @@ export interface ProductDetail extends Omit<SearchProduct, 'price'> {
   brand: string | null;
   /** `In stock`, `Currently unavailable`, or `null` when not stated. */
   availability: string | null;
+  /**
+   * Normalised availability, e.g. `CURRENTLY_UNAVAILABLE`.
+   *
+   * `UNKNOWN` whenever the page does not state one. Never inferred from a
+   * missing price or a missing Add to Cart button: those absences have too many
+   * causes to mean anything on their own.
+   */
+  availabilityStatus?: string | null;
+  /** Availability text exactly as Amazon printed it. Never translated. */
+  availabilityMessage?: string | null;
+  /** Dispatch/shipping-provenance text verbatim. NOT an out-of-stock verdict. */
+  shippingMessage?: string | null;
+  /** Price warnings verbatim. A warning about a price is never the price. */
+  priceWarning?: string | null;
+  /** Buying-options control text verbatim, when Amazon offered one. */
+  buyingOptionsMessage?: string | null;
+  /** Every distinct message seen, in page order. Diagnostic column. */
+  pageMessages?: string[];
+  /** True when a variation must be selected before a price can exist. */
+  selectionRequired?: boolean;
+  /** Which variation Amazon asked for, e.g. `['Size']`. */
+  selectionTypes?: string[];
+  /**
+   * Why the product price is missing, or `EXTRACTED` when there is one.
+   *
+   * `null` price plus `NOT_AVAILABLE_IN_SOURCE` is a fact about the source, and
+   * is not the same as a zero and not the same as a failed extraction.
+   */
+  priceStatus?: string | null;
+  /** What kind of page Amazon served. See `PageState`. */
+  pageState?: string | null;
+  /** Why that classification was reached, in words. */
+  pageStateReason?: string | null;
   /** Bullet-point feature list, cleaned of markup. */
   features: string[];
   description: string | null;
@@ -81,6 +114,33 @@ export interface ProductDetail extends Omit<SearchProduct, 'price'> {
    * traced to a session that never localised rather than to the parser.
    */
   localisationNote?: string;
+  /**
+   * ASIN the job asked for.
+   *
+   * Distinct from `asin`, which is the ASIN of the variation that actually
+   * rendered. Amazon routinely swaps the URL to a child ASIN once a variation is
+   * selected, and overwriting the requested one would silently merge two products.
+   */
+  requestedAsin?: string | null;
+  /** Observed ASIN after any variation selection, when it differs. */
+  variationAsin?: string | null;
+  /** Selected variation attributes, e.g. `{ Size: 'Large' }`. Only what is displayed. */
+  variationAttributes?: Record<string, string> | null;
+  /**
+   * Why this record's observations do or do not cover every variation.
+   *
+   * `null` when the page required no variation, so the record speaks for the
+   * product. A sentence when selection was required or exploration was partial,
+   * so a report never implies coverage it does not have.
+   */
+  variationNote?: string | null;
+  /**
+   * Whether every variation this page offered was inspected.
+   *
+   * `false` whenever exploration stopped at the configured bound, on an
+   * unavailable variation, or when Amazon restricted access mid-exploration.
+   */
+  variationsComplete?: boolean;
   /**
    * Marketplace this product was scraped from. `amazon.eg` + ASIN and
    * `amazon.com` + the same ASIN are distinct records throughout the system.
@@ -264,6 +324,21 @@ export interface ProductWithOffers extends ProductDetail {
   offersTotalCount: number | null;
   /** Pages of the offers list actually read. */
   offersPagesFetched: number;
+  /**
+   * Whether Amazon's buying-options panel was opened for this product.
+   *
+   * Distinct from `offersComplete`: a product with no offers at all is a
+   * different fact from one whose offers Amazon hid.
+   */
+  buyingOptionsOpened?: boolean;
+  /**
+   * One record per explored variation.
+   *
+   * Kept beside the parent rather than merged into it, because merging would
+   * attribute one child's sellers and price to another. Each entry carries its
+   * own `asin`, `requestedAsin` and `variationAttributes`.
+   */
+  variationSnapshots?: ProductWithOffers[];
   /** Marketplace host. */
   domain: string;
   /** ISO timestamp of when this snapshot was taken. */

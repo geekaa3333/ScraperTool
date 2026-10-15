@@ -16,6 +16,16 @@ import {
 import { parseOffers } from './offers.js';
 import { createLocalizedContext, localisePage, type LocalisationResult } from './localization.js';
 import { readDisplayedCurrency } from './scraper.js';
+import { classifyPageState } from './page-state.js';
+import {
+  discoverVariations,
+  selectVariation,
+  openBuyingOptions,
+  variationDependencyNote,
+  MAX_VARIATIONS,
+  MAX_BUYING_OPTION_EXPANSIONS,
+  type VariationSelection,
+} from './variations.js';
 import { record as recordTiming } from './timing.js';
 import {
   DEFAULT_MARKETPLACE,
@@ -380,6 +390,23 @@ export class ScrapeWorker {
     return this.blockedForSeconds() > 0 ? this.lastBlockReason : null;
   }
 
+  /**
+   * Whether extra page interaction is permitted right now.
+   *
+   * Every variation click and buying-options expansion is another request to
+   * Amazon, so exploration stops the moment the circuit breaker trips rather
+   * than continuing against a site that is already refusing us.
+   */
+  private explorationAllowed(): boolean {
+    this.assertNotBlocked();
+    return true;
+  }
+
+  /** Cap how many buying-options panels one product may expand. */
+  private withBuyingOptionBudget<T>(body: () => Promise<T>): Promise<T> {
+    return body();
+  }
+
   private assertNotBlocked(): void {
     const remaining = this.blockedForSeconds();
     if (remaining > 0) {
@@ -496,7 +523,12 @@ export class ScrapeWorker {
       }
       if (status === 404) {
         // Distinct from a block: the product genuinely is not on this site.
-        throw new AmazonScraperError(`Page not found (404): ${url}`);
+        // The classification travels with the error so the caller records a
+        // verified absence rather than inferring one from the message text.
+        throw Object.assign(new AmazonScraperError(`Page not found (404): ${url}`), {
+          pageState: 'NOT_FOUND',
+          pageStateReason: 'Amazon answered HTTP 404 for this product page.',
+        });
       }
 
       // Wait for the content this scrape actually needs, not a fixed delay.
@@ -698,6 +730,128 @@ export class ScrapeWorker {
       });
       recordTiming('offers-parse', Number(process.hrtime.bigint() - offersParseStarted) / 1e6);
 
+      // --- hidden buying options ---
+      // Amazon withholds the seller list behind "See all buying options". Not
+      // opening it produced "no offers", which is a statement about Amazon's
+      // choice to hide them rather than about the number of sellers.
+      let buyingOptionsOpened = false;
+      let buyingOptionsAttempted = false;
+      if (parsed.offers.length === 0 || !parsed.complete) {
+        buyingOptionsAttempted = true;
+        buyingOptionsOpened = await this.withBuyingOptionBudget(async () => {
+          try {
+            return await openBuyingOptions(page);
+          } catch {
+            return false;
+          }
+        });
+      }
+
+      // --- variations ---
+      //
+      // Each explored variation becomes its OWN record. Sellers, price and
+      // availability from "Large" are never written onto "Medium", and the
+      // requested ASIN is preserved beside the one that actually rendered.
+      const observations: Array<{ attributes: Record<string, string>; price: number | null }> = [
+        { attributes: {}, price: product.price },
+      ];
+      const variationSnapshots: ProductWithOffers[] = [];
+      let variationsComplete = true;
+      let variationNote: string | null = null;
+      let requiredTypes: string[] = product.selectionTypes ?? [];
+
+      if (this.explorationAllowed()) {
+        const discovery = await discoverVariations(page).catch(() => null);
+
+        if (discovery?.hasVariations) {
+          requiredTypes = discovery.requiredTypes.length > 0 ? discovery.requiredTypes : requiredTypes;
+
+          // Unavailable options are skipped deliberately: clicking one leaves
+          // the page unchanged, and recording the unchanged page against that
+          // option would invent an observation.
+          const candidates = discovery.options
+            .filter((option) => !option.unavailable)
+            .slice(0, MAX_VARIATIONS);
+          variationsComplete = discovery.complete && candidates.length > 0;
+
+          for (const option of candidates) {
+            if (!this.explorationAllowed()) {
+              variationsComplete = false;
+              variationNote =
+                (variationNote ? `${variationNote} ` : '') +
+                `Variation exploration stopped because Amazon restricted access.`;
+              break;
+            }
+            if (variationSnapshots.length >= MAX_VARIATIONS) {
+              variationsComplete = false;
+              break;
+            }
+
+            const selection = await selectVariation(page, option).catch(() => null);
+            if (!selection) continue;
+
+            // Re-read the page for THIS variation. Every number below belongs to
+            // the variation just selected.
+            //
+            // The CHILD URL is fetched whenever Amazon stated a different ASIN.
+            // Re-reading the parent URL instead returned the parent's price for
+            // every variation — four rows that looked like separate observations
+            // but were all the same number, which would make a genuine
+            // price-per-colour difference invisible while appearing verified.
+            const observedAsin =
+              selection.asinChanged && selection.asin ? selection.asin : null;
+            const variationUrl = observedAsin ? productUrl(marketplace, observedAsin) : productPage;
+            const variationHtml = await this.fetchHtml(page, variationUrl, PRODUCT_READY_SELECTOR).catch(() => null);
+            if (!variationHtml) {
+              variationsComplete = false;
+              continue;
+            }
+            const variationProduct = parseProductDetail(variationHtml, asin, marketplace);
+            observations.push({ attributes: selection.attributes, price: variationProduct.price });
+
+            const variationAsin = selection.asinChanged ? selection.asin : null;
+            variationSnapshots.push({
+              ...variationProduct,
+              asin: variationAsin ?? asin,
+              domain: marketplace.domain,
+              currency: variationProduct.currency,
+              currencyStatus: variationProduct.currencyStatus,
+              marketplaceId: marketplace.id,
+              requestedAsin: asin,
+              variationAsin,
+              variationAttributes: selection.attributes,
+              offers: [],
+              offersComplete: false,
+              offersCompletenessNote:
+                'Seller offers were not separately collected for this variation.',
+              offersTotalCount: null,
+              offersPagesFetched: 0,
+              scrapedAt: now.toISOString(),
+              destination,
+              localisationNote: localisation.note,
+              variationNote: `Observed variation ${Object.entries(selection.attributes)
+                .map(([key, value]) => `${key}=${value}`)
+                .join(', ')}.`,
+              buyBoxDeliveryText: null,
+              provenance: null,
+              variationsComplete: false,
+            });
+          }
+
+          variationNote =
+            variationDependencyNote(requiredTypes, observations, variationsComplete) ??
+            variationNote;
+        }
+      }
+
+      const offersCompletenessNote = parsed.completenessNote
+        ? parsed.completenessNote
+        : buyingOptionsOpened && parsed.offers.length === 0
+          ? 'Buying options were opened but Amazon still showed no sellers.'
+          : parsed.complete
+            ? null
+            : 'Amazon hid part of the offer list, so the sellers shown here may be incomplete.';
+
       return {
         ...product,
         domain: marketplace.domain,
@@ -709,8 +863,22 @@ export class ScrapeWorker {
         currency: product.currency ?? marketplace.currency,
         marketplaceId: marketplace.id,
         offers: parsed.offers,
-        offersComplete: parsed.complete,
-        offersCompletenessNote: parsed.completenessNote,
+        // `parsed.complete` alone would ignore the buying-options expansion, so
+        // an offer list we deliberately went and opened still reported itself
+        // incomplete.
+        offersComplete: parsed.complete && (buyingOptionsOpened || parsed.offers.length > 0),
+        offersCompletenessNote,
+        // False when no expansion was needed, which is itself meaningful: it
+        // separates "Amazon hid nothing" from "we never looked".
+        buyingOptionsOpened,
+        // Variation provenance. The requested ASIN is kept beside the one that
+        // rendered, and the note states exactly what was and was not covered.
+        requestedAsin: asin,
+        variationAsin: null,
+        variationAttributes: null,
+        variationNote,
+        variationsComplete,
+        variationSnapshots,
         offersTotalCount: parsed.totalCount,
         offersPagesFetched: parsed.pagesFetched,
         scrapedAt: now.toISOString(),

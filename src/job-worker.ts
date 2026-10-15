@@ -359,6 +359,23 @@ export class DurableJobWorker {
       // two steps the item is retried and the idempotent save replaces the
       // snapshot instead of duplicating it.
       await this.store.saveResult(job.userId, job.jobId, product, product.offers as never[]);
+
+      // Each explored variation is saved as its OWN row, keyed on its own ASIN.
+      //
+      // They are deliberately not folded into the parent: merging would file a
+      // child's sellers and price under the parent, which is how a report ends
+      // up claiming one price for a product whose sizes all differ. `saveResult`
+      // is idempotent per (job, marketplace, asin), so a retried item replaces
+      // these rows instead of accumulating them.
+      const variationRows = (product.variationSnapshots ?? []) as unknown as Array<Record<string, unknown>>;
+      for (const variation of variationRows) {
+        await this.store.saveResult(
+          job.userId,
+          job.jobId,
+          variation,
+          ((variation.offers ?? []) as unknown[]) as never[],
+        );
+      }
       await this.store.completeItem(job.userId, job.jobId, item.marketplaceId, item.asin, 'DONE');
 
       const elapsed = Date.now() - startedAt;

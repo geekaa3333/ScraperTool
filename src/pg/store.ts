@@ -1076,8 +1076,15 @@ export class PostgresStore implements DataStore {
                                        price_text, price, currency, domain, rating_text,
                                        review_count, availability, image, description, features,
                                        destination, provenance, offers_total_count,
-                                       offers_complete, offers_completeness_note, currency_status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+                                       offers_complete, offers_completeness_note, currency_status,
+                                       availability_status, availability_message, shipping_message,
+                                       price_warning, buying_options_message, page_messages,
+                                       selection_required, selection_types, price_status,
+                                       page_state, page_state_reason,
+                                       requested_asin, variation_asin, variation_attributes,
+                                       variation_note, variations_complete, buying_options_opened)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,
+               $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39)
        RETURNING snapshot_id`,
       [
         userId, jobId,
@@ -1097,6 +1104,26 @@ export class PostgresStore implements DataStore {
         // Provenance for the currency, so a value inferred from the marketplace
         // is never later read as one Amazon actually printed.
         (product.currencyStatus as string) ?? null,
+        // What the page stated, kept apart from what was merely absent.
+        (product.availabilityStatus as string) ?? null,
+        (product.availabilityMessage as string) ?? null,
+        (product.shippingMessage as string) ?? null,
+        (product.priceWarning as string) ?? null,
+        (product.buyingOptionsMessage as string) ?? null,
+        JSON.stringify(product.pageMessages ?? []),
+        Boolean(product.selectionRequired),
+        JSON.stringify(product.selectionTypes ?? []),
+        (product.priceStatus as string) ?? null,
+        (product.pageState as string) ?? null,
+        (product.pageStateReason as string) ?? null,
+        // The job's ASIN, kept beside the one that rendered. Defaults to the
+        // record's own ASIN when no variation was explored.
+        (product.requestedAsin as string) ?? (product.asin as string),
+        (product.variationAsin as string) ?? null,
+        JSON.stringify(product.variationAttributes ?? null),
+        (product.variationNote as string) ?? null,
+        product.variationsComplete === undefined ? null : Boolean(product.variationsComplete),
+        product.buyingOptionsOpened === undefined ? null : Boolean(product.buyingOptionsOpened),
       ],
     );
     const snapshotId = first(rows, 'saveResult').snapshot_id;
@@ -1240,6 +1267,23 @@ export class PostgresStore implements DataStore {
         }),
         offersComplete: Boolean(snapshot.offers_complete),
         offersCompletenessNote: snapshot.offers_completeness_note ?? null,
+        availabilityStatus: snapshot.availability_status ?? null,
+        availabilityMessage: snapshot.availability_message ?? null,
+        shippingMessage: snapshot.shipping_message ?? null,
+        priceWarning: snapshot.price_warning ?? null,
+        buyingOptionsMessage: snapshot.buying_options_message ?? null,
+        pageMessages: safeJson(snapshot.page_messages, []),
+        selectionRequired: Boolean(snapshot.selection_required),
+        selectionTypes: safeJson(snapshot.selection_types, []),
+        priceStatus: snapshot.price_status ?? null,
+        pageState: snapshot.page_state ?? null,
+        pageStateReason: snapshot.page_state_reason ?? null,
+        requestedAsin: snapshot.requested_asin ?? snapshot.asin,
+        variationAsin: snapshot.variation_asin ?? null,
+        variationAttributes: safeJson(snapshot.variation_attributes, null),
+        variationNote: snapshot.variation_note ?? null,
+        variationsComplete: snapshot.variations_complete ?? null,
+        buyingOptionsOpened: snapshot.buying_options_opened ?? null,
         offersTotalCount: num(snapshot.offers_total_count),
         scrapedAt: String(snapshot.scraped_at),
         destination: safeJson(snapshot.destination, null),

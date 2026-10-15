@@ -232,6 +232,27 @@ export class SqliteStore implements DataStore {
       ['seller_offers', 'delivery_original_text', 'TEXT'],
       ['seller_offers', 'positive_percent_source', 'TEXT'],
       ['product_snapshots', 'currency_status', 'TEXT'],
+      // What the page said, as distinct from what was merely absent.
+      ['product_snapshots', 'availability_status', 'TEXT'],
+      ['product_snapshots', 'availability_message', 'TEXT'],
+      ['product_snapshots', 'shipping_message', 'TEXT'],
+      ['product_snapshots', 'price_warning', 'TEXT'],
+      ['product_snapshots', 'buying_options_message', 'TEXT'],
+      ['product_snapshots', 'page_messages_json', 'TEXT'],
+      ['product_snapshots', 'selection_required', 'INTEGER'],
+      ['product_snapshots', 'selection_types_json', 'TEXT'],
+      ['product_snapshots', 'price_status', 'TEXT'],
+      ['product_snapshots', 'page_state', 'TEXT'],
+      ['product_snapshots', 'page_state_reason', 'TEXT'],
+      // Variation identity. `requested_asin` keeps the job's ASIN beside the one
+      // that actually rendered, so a child's sellers are never filed under the
+      // parent and the two are never confused in a report.
+      ['product_snapshots', 'requested_asin', 'TEXT'],
+      ['product_snapshots', 'variation_asin', 'TEXT'],
+      ['product_snapshots', 'variation_attributes_json', 'TEXT'],
+      ['product_snapshots', 'variation_note', 'TEXT'],
+      ['product_snapshots', 'variations_complete', 'INTEGER'],
+      ['product_snapshots', 'buying_options_opened', 'INTEGER'],
     ];
 
     for (const [table, column, type] of columns) {
@@ -1204,8 +1225,15 @@ export class SqliteStore implements DataStore {
                                            rating_text, review_count, availability, image,
                                            description, features, destination, provenance,
                                            offers_total_count, offers_complete,
-                                           offers_completeness_note, scraped_at, currency_status)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                           offers_completeness_note, scraped_at, currency_status,
+                                           availability_status, availability_message, shipping_message,
+                                           price_warning, buying_options_message, page_messages_json,
+                                           selection_required, selection_types_json, price_status,
+                                           page_state, page_state_reason,
+                                           requested_asin, variation_asin, variation_attributes_json,
+                                           variation_note, variations_complete, buying_options_opened)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                                                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT (job_id, marketplace_id, asin) DO UPDATE SET
              title = excluded.title,
              brand = excluded.brand,
@@ -1225,7 +1253,24 @@ export class SqliteStore implements DataStore {
              offers_complete = excluded.offers_complete,
              offers_completeness_note = excluded.offers_completeness_note,
              scraped_at = excluded.scraped_at,
-             currency_status = excluded.currency_status`,
+             currency_status = excluded.currency_status,
+             availability_status = excluded.availability_status,
+             availability_message = excluded.availability_message,
+             shipping_message = excluded.shipping_message,
+             price_warning = excluded.price_warning,
+             buying_options_message = excluded.buying_options_message,
+             page_messages_json = excluded.page_messages_json,
+             selection_required = excluded.selection_required,
+             selection_types_json = excluded.selection_types_json,
+             price_status = excluded.price_status,
+             page_state = excluded.page_state,
+             page_state_reason = excluded.page_state_reason,
+             requested_asin = excluded.requested_asin,
+             variation_asin = excluded.variation_asin,
+             variation_attributes_json = excluded.variation_attributes_json,
+             variation_note = excluded.variation_note,
+             variations_complete = excluded.variations_complete,
+             buying_options_opened = excluded.buying_options_opened`,
         )
         .run(
           snapshotId,
@@ -1252,6 +1297,27 @@ export class SqliteStore implements DataStore {
           (product.offersCompletenessNote as string) ?? null,
           scrapedAt,
           (product.currencyStatus as string) ?? null,
+          (product.availabilityStatus as string) ?? null,
+          (product.availabilityMessage as string) ?? null,
+          (product.shippingMessage as string) ?? null,
+          (product.priceWarning as string) ?? null,
+          (product.buyingOptionsMessage as string) ?? null,
+          json(product.pageMessages ?? []),
+          boolInt(product.selectionRequired),
+          json(product.selectionTypes ?? []),
+          (product.priceStatus as string) ?? null,
+          (product.pageState as string) ?? null,
+          (product.pageStateReason as string) ?? null,
+          // Defaults to the record's own ASIN: for a product with no variation
+          // explored, the requested and observed ASIN are the same thing.
+          (product.requestedAsin as string) ?? asin,
+          (product.variationAsin as string) ?? null,
+          json(product.variationAttributes ?? null),
+          (product.variationNote as string) ?? null,
+          // Unknown (null) when never collected, so historical rows are not
+          // retroactively claimed as fully explored.
+          product.variationsComplete === undefined ? null : boolInt(product.variationsComplete),
+          product.buyingOptionsOpened === undefined ? null : boolInt(product.buyingOptionsOpened),
         );
 
       // ON CONFLICT DO UPDATE assigns to `excluded.snapshot_id`, so the id is

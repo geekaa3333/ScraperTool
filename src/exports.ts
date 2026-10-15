@@ -61,6 +61,47 @@ export interface ExportRow {
   productRating: string | null;
   reviewCount: string | null;
   productAvailability: string | null;
+  /**
+   * What the page stated, split by kind.
+   *
+   * These are NOT collapsed into one status. "Currently unavailable" is an
+   * availability statement, "dispatched from" is shipping provenance and is not
+   * an out-of-stock verdict, "price higher than typical" is a warning ABOUT a
+   * price and is not the price, and "see all buying options" is a control that
+   * may reveal sellers. Folding them together would turn four different facts
+   * into one misleading word.
+   */
+  availabilityStatus: string | null;
+  /** Availability text verbatim. Never translated. */
+  availabilityMessage: string | null;
+  /** Dispatch/shipping-provenance text verbatim. */
+  shippingMessage: string | null;
+  /** Price warnings verbatim. Never used as the price. */
+  priceWarning: string | null;
+  /** Buying-options control text verbatim. */
+  buyingOptionsMessage: string | null;
+  /** Why the price is absent, or EXTRACTED when present. */
+  priceMissingReason: string | null;
+  /** What kind of page Amazon served. */
+  pageStatus: string | null;
+  /** Why that classification was reached, in words. */
+  pageMessage: string | null;
+  /** Internal outcome code. */
+  extractionStatus: string | null;
+  /** Human-readable explanation for the outcome. */
+  extractionNote: string | null;
+  /** The ASIN the job asked for. */
+  requestedAsin: string | null;
+  /** The ASIN that actually rendered, when it differs. */
+  variationAsin: string | null;
+  variationType: string | null;
+  selectedSize: string | null;
+  selectedColor: string | null;
+  selectedAttributes: string | null;
+  /** What variation exploration did and did not cover. */
+  variationNote: string | null;
+  /** False whenever variation coverage was partial. */
+  variationsComplete: boolean | null;
   // --- seller ---
   sellerName: string | null;
   sellerId: string | null;
@@ -135,7 +176,31 @@ export const EXPORT_COLUMNS: Column[] = [
   { key: 'productPriceText', header: 'Product Price (as displayed)', width: 22 },
   { key: 'productRating', header: 'Product Rating', width: 14 },
   { key: 'reviewCount', header: 'Review Count', width: 13 },
+  // What the page actually said. Kept beside the normalised status so a reader
+  // can check the classification against Amazon's own words instead of trusting
+  // it. Never translated: Arabic stays Arabic.
   { key: 'productAvailability', header: 'Availability', width: 18 },
+  { key: 'availabilityStatus', header: 'Availability Status', width: 22 },
+  { key: 'availabilityMessage', header: 'Availability Message', width: 40 },
+  { key: 'shippingMessage', header: 'Shipping / Dispatch Message', width: 44 },
+  { key: 'priceWarning', header: 'Price Warning', width: 34 },
+  { key: 'buyingOptionsMessage', header: 'Buying Options Status', width: 28 },
+  { key: 'priceMissingReason', header: 'Price Missing Reason', width: 24 },
+  { key: 'pageStatus', header: 'Page Status', width: 20 },
+  { key: 'pageMessage', header: 'Page Message', width: 46 },
+  { key: 'extractionStatus', header: 'Extraction Status', width: 22 },
+  { key: 'extractionNote', header: 'Extraction Note', width: 46 },
+
+  // Variation identity. Requested and observed ASIN are separate columns so a
+  // child's price is never read as the parent's.
+  { key: 'requestedAsin', header: 'Requested ASIN', width: 15 },
+  { key: 'variationAsin', header: 'Selected / Observed ASIN', width: 20 },
+  { key: 'variationType', header: 'Variation Type', width: 15 },
+  { key: 'selectedSize', header: 'Selected Size', width: 15 },
+  { key: 'selectedColor', header: 'Selected Color', width: 15 },
+  { key: 'selectedAttributes', header: 'Other Selected Attributes', width: 26 },
+  { key: 'variationNote', header: 'Variation Note', width: 38 },
+  { key: 'variationsComplete', header: 'Variations Complete', width: 18 },
 
   { key: 'sellerName', header: 'Seller Name', width: 26 },
   { key: 'sellerId', header: 'Seller ID', width: 16 },
@@ -220,6 +285,8 @@ export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
     productRating: product.rating,
     reviewCount: product.reviewCount,
     productAvailability: product.availability,
+    ...pageMessageFields(product),
+    ...variationFields(product),
     // Per-row, resolved by `resolveCurrency`: never a global default. An
     // unknown marketplace yields null rather than silently becoming EGP.
     currency: resolveCurrency(product.marketplaceId, product.currency, marketplace).code,
@@ -345,6 +412,71 @@ function rowForOffer(
 }
 
 /**
+ * Page-message columns for one product record.
+ *
+ * `pageStatus` and `extractionStatus` are kept separate on purpose: one
+ * describes what Amazon served, the other what we did about it. A page can be
+ * an Amazon error page (pageStatus) that we nonetheless extracted cleanly from
+ * (extractionStatus EXTRACTED), and collapsing them loses that.
+ */
+function pageMessageFields(product: {
+  availabilityStatus?: string | null;
+  availabilityMessage?: string | null;
+  shippingMessage?: string | null;
+  priceWarning?: string | null;
+  buyingOptionsMessage?: string | null;
+  priceStatus?: string | null;
+  pageState?: string | null;
+  pageStateReason?: string | null;
+  offersComplete?: boolean;
+  offersCompletenessNote?: string | null;
+}) {
+  return {
+    availabilityStatus: product.availabilityStatus ?? 'UNKNOWN',
+    availabilityMessage: product.availabilityMessage ?? null,
+    shippingMessage: product.shippingMessage ?? null,
+    priceWarning: product.priceWarning ?? null,
+    buyingOptionsMessage: product.buyingOptionsMessage ?? null,
+    priceMissingReason: product.priceStatus ?? null,
+    pageStatus: product.pageState ?? 'UNKNOWN',
+    pageMessage: product.pageStateReason ?? null,
+    // A product that produced a price or a real availability answer is an
+    // EXTRACTION, even with no price. Only a genuine failure is a failure.
+    extractionStatus: product.pageState === 'PRODUCT' ? 'EXTRACTED' : (product.pageState ?? 'UNKNOWN'),
+    extractionNote: product.pageStateReason ?? product.offersCompletenessNote ?? null,
+  };
+}
+
+/** Variation columns for one product record. */
+function variationFields(product: {
+  requestedAsin?: string | null;
+  asin?: string;
+  variationAsin?: string | null;
+  variationAttributes?: Record<string, string> | null;
+  variationNote?: string | null;
+  variationsComplete?: boolean | null;
+}) {
+  const attributes = product.variationAttributes ?? {};
+  const others = Object.entries(attributes)
+    .filter(([key]) => key !== 'Size' && key !== 'Color')
+    .map(([key, value]) => `${key}=${value}`)
+    .join(', ');
+
+  return {
+    requestedAsin: product.requestedAsin ?? product.asin ?? null,
+    variationAsin: product.variationAsin ?? null,
+    variationType: Object.keys(attributes).join(', ') || null,
+    selectedSize: attributes.Size ?? null,
+    selectedColor: attributes.Color ?? null,
+    selectedAttributes: others.length > 0 ? others : null,
+    variationNote: product.variationNote ?? null,
+    // Stays null when never collected, so a pre-existing row is not retroactively
+    // claimed as fully explored.
+    variationsComplete: product.variationsComplete ?? null,
+  };
+}
+
+/**
  * A row recording that one (marketplace, ASIN) pair yielded no scrape.
  *
  * The marketplace is carried through so a failure in one market is still a
@@ -389,6 +521,26 @@ export function failedRow(
     productRating: null,
     reviewCount: null,
     productAvailability: null,
+    // No page was read, so nothing about it is claimed. The failure reason goes
+    // in the note rather than being presented as a page observation.
+    availabilityStatus: 'UNKNOWN',
+    availabilityMessage: null,
+    shippingMessage: null,
+    priceWarning: null,
+    buyingOptionsMessage: null,
+    priceMissingReason: null,
+    pageStatus: status === 'NOT_FOUND' ? 'NOT_FOUND' : 'UNKNOWN',
+    pageMessage: null,
+    extractionStatus: status,
+    extractionNote: detail,
+    requestedAsin: asin,
+    variationAsin: null,
+    variationType: null,
+    selectedSize: null,
+    selectedColor: null,
+    selectedAttributes: null,
+    variationNote: null,
+    variationsComplete: null,
     sellerName: null,
     sellerId: null,
     sellerPrice: null,
