@@ -284,18 +284,31 @@ function destinationAccepted(shown: string, marketplace: Marketplace): boolean {
   const destination = marketplace.defaultDestination;
   const needle = (destination.countryCode ?? '').toLowerCase();
   const city = (destination.amazonLabel ?? '').toLowerCase();
+  const label = (destination.label ?? '').toLowerCase();
 
-  // This header names the country, not the ISO code.
-  const countryNames: Record<string, string> = {
-    FR: 'france', GB: 'united kingdom', EG: 'egypt',
-    AE: 'united arab emirates', SA: 'saudi arabia', CA: 'canada', US: 'united states',
+  // This header names a place, not the ISO code, and Amazon abbreviates
+  // ("New York 10001", "Deliver to France"). A single country name is therefore
+  // not enough — for amazon.eg the header reads "New Cairo..." rather than
+  // "Egypt", and for amazon.ae it reads "Dubai" rather than "UAE". Matching
+  // only the country name made every Egyptian delivery look like a failure.
+  const countryNames: Record<string, string[]> = {
+    FR: ['france', 'paris'],
+    GB: ['united kingdom', 'london'],
+    EG: ['egypt', 'cairo', 'new cairo', 'alexandria', 'giza'],
+    AE: ['united arab emirates', 'dubai', 'abu dhabi'],
+    SA: ['saudi arabia', 'riyadh', 'jeddah'],
+    CA: ['canada', 'toronto'],
+    US: ['united states', 'new york'],
   };
-  const countryName = countryNames[needle] ?? needle;
+  const needles = countryNames[needle] ?? [needle];
 
   const haystack = shown.toLowerCase();
-  if (countryName.length > 2 && haystack.includes(countryName)) return true;
+  for (const n of needles) {
+    if (n.length > 2 && haystack.includes(n)) return true;
+  }
   if (needle.length === 2 && haystack.includes(needle)) return true;
   if (city.length > 2 && haystack.includes(city)) return true;
+  if (label.length > 2 && haystack.includes(label.split(',')[0]!.trim())) return true;
   return false;
 }
 

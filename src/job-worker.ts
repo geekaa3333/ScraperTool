@@ -106,10 +106,12 @@ export class DurableJobWorker {
    */
   private jobContexts = new Map<string, import('playwright').BrowserContext>();
 
-  private async contextFor(marketplace: import('./marketplaces.js').Marketplace): Promise<import('playwright').BrowserContext> {
+  private async contextFor(marketplace: import('./marketplaces.js').Marketplace): Promise<import('playwright').BrowserContext | undefined> {
     const existing = this.jobContexts.get(marketplace.id);
     if (existing) return existing;
-    const browser = await (this.scraper as unknown as { getBrowser(): Promise<import('playwright').Browser> }).getBrowser();
+    const getBrowser = (this.scraper as unknown as { getBrowser?: () => Promise<import('playwright').Browser> }).getBrowser;
+    if (typeof getBrowser !== 'function') return undefined;
+    const browser = await getBrowser.call(this.scraper);
     const { createLocalizedContext } = await import('./localization.js');
     const context = await createLocalizedContext(browser, marketplace);
     this.jobContexts.set(marketplace.id, context);
@@ -382,7 +384,7 @@ export class DurableJobWorker {
 
     try {
       const context = await this.contextFor(marketplace);
-      const product = await this.scraper.scrapeProduct(item.asin, destination, marketplace, {}, context);
+      const product = await this.scraper.scrapeProduct(item.asin, destination, marketplace, {}, context ?? undefined);
 
       // Persist before acknowledging the item. If the worker dies between these
       // two steps the item is retried and the idempotent save replaces the

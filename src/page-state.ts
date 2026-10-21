@@ -318,6 +318,12 @@ const RESTRICTION_MARKERS: RegExp[] = [
   /\bsorry, we just need to make sure you'?re not a robot\b/i,
   /\bsign-in required to continue\b/i,
   /\bverify your identity\b/i,
+  // Amazon's "click to continue" interstitial (amazon.eg's most common variant).
+  /validatecaptcha/i,
+  /errors_page\/validatecaptcha/i,
+  /انقر\s*فوق\s*الزر/i,
+  /لمتابعة\s*التسوق/i,
+  /click the button below to continue shopping/i,
   // 'automated access to amazon data' and 'api-services-support@amazon.com' are
   // deliberately omitted: they appear in the standard footer of every Amazon
   // page, in every language, and matching them reported every product as
