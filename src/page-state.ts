@@ -316,10 +316,12 @@ const RESTRICTION_MARKERS: RegExp[] = [
   /\benter the characters you see below\b/i,
   /\btype the characters you see in this image\b/i,
   /\bsorry, we just need to make sure you'?re not a robot\b/i,
-  /\bto discuss automated access to amazon data\b/i,
   /\bsign-in required to continue\b/i,
   /\bverify your identity\b/i,
-  /\bautomated access to amazon data\b/i,
+  // 'automated access to amazon data' and 'api-services-support@amazon.com' are
+  // deliberately omitted: they appear in the standard footer of every Amazon
+  // page, in every language, and matching them reported every product as
+  // ACCESS_RESTRICTED.
 ];
 
 /**
@@ -348,7 +350,13 @@ export function classifyPageState(
   const lower = html.toLowerCase();
 
   // 1. Restrictions first. Never reinterpreted as absence.
-  if (RESTRICTION_MARKERS.some((re) => re.test(lower))) {
+  //
+  // Only when the page does not carry a product. The footer of a healthy
+  // Amazon page contains the same words as a real challenge page, so matching
+  // them unconditionally would classify every product as ACCESS_RESTRICTED
+  // whenever the footer rendered before the capture.
+  const hasProduct = PRODUCT_MARKERS.some((marker) => lower.includes(marker));
+  if (!hasProduct && RESTRICTION_MARKERS.some((re) => re.test(lower))) {
     return {
       state: 'ACCESS_RESTRICTED',
       reason: 'Amazon served a verification or access-restriction page.',
@@ -356,7 +364,6 @@ export function classifyPageState(
   }
 
   // 2. A real product page, established by structure rather than by title text.
-  const hasProduct = PRODUCT_MARKERS.some((marker) => lower.includes(marker));
   if (hasProduct) return { state: 'PRODUCT', reason: null };
 
   // 3. An HTTP 404 is a confirmed absence — but only when nothing else explains

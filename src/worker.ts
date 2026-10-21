@@ -237,10 +237,12 @@ export class AccessRestrictedError extends AmazonScraperError {
 const BOT_CHECK_MARKERS = [
   'robot check',
   'type the characters you see below',
-  'automated access to amazon data',
   "sorry, we just need to make sure you're not a robot",
   'enter the characters you see below',
-  'api-services-support@amazon.com',
+  // NOTE: 'automated access to amazon data' and 'api-services-support@amazon.com'
+  // were previously on this list. They appear in the STANDARD FOOTER of every
+  // Amazon page, in English and in Arabic, so they tripped the breaker on
+  // normal product pages. They are not evidence of a challenge.
 ];
 
 /**
@@ -544,7 +546,14 @@ export class ScrapeWorker {
       const contentStarted = process.hrtime.bigint();
       const html = await page.content();
       const lower = html.toLowerCase();
-      const marker = BOT_CHECK_MARKERS.find((candidate) => lower.includes(candidate));
+      // Only treat these as a challenge when the page does not carry a product.
+      // The footer of a perfectly healthy Amazon page contains the same words
+      // (it is Amazon's standard API-access notice, in every language), so
+      // matching them unconditionally tripped the breaker on normal pages —
+      // which is exactly the "processing paused, Amazon served a bot challenge"
+      // message that appeared every few products on amazon.eg.
+      const hasProduct = /id=["']productTitle["']|id=["']title["']|<h1[^>]*id=["']title/i.test(html);
+      const marker = hasProduct ? undefined : BOT_CHECK_MARKERS.find((candidate) => lower.includes(candidate));
       if (marker) {
         this.tripBlock(`Amazon served a bot challenge for ${url}`);
         throw new AccessRestrictedError(
