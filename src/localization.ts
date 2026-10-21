@@ -365,6 +365,20 @@ export async function applyDeliveryDestination(
   log: (message: string) => void = () => undefined,
 ): Promise<DestinationOutcome> {
   const destination = marketplace.defaultDestination;
+
+  // Idempotency: if this context is already delivering to the right place,
+  // do nothing. A job that reuses one browser context per marketplace would
+  // otherwise re-open the location modal, re-select the country and reload
+  // the page for EVERY ASIN, paying for a full round-trip each time for a
+  // destination that was already set. Skipping this is the single biggest
+  // safe speedup available, because it leaves the 4000 ms access floor and
+  // every other invariant untouched.
+  const already = await readDisplayedDestination(page);
+  if (already !== null && destinationAccepted(already, marketplace)) {
+    log(`[localise] ${marketplace.id}: destination already applied ("${already}") — skipping re-application`);
+    return { applied: true, status: 'APPLIED', displayed: already, reason: null };
+  }
+
   // No postal code means this marketplace has no CONFIGURED destination. Nothing
   // is invented in its place.
   if (!destination?.postalCode || destination.verified === false) {
@@ -545,6 +559,11 @@ export async function localisePage(
     `[localise] ${marketplace.id}: destination ${destination.status} — ` +
       `${destination.applied ? marketplace.defaultDestination?.postalCode ?? '' : destination.reason ?? ''}`,
   );
+
+  // Whether applyDeliveryDestination actually drove the control. When it
+  // returned APPLIED because the destination was already set, there is nothing
+  // to reload — and reloading would just re-pay for a page we already have.
+  const appliedNow = destination.applied && destination.displayed === null;
 
   // Reload so the price read reflects the settings rather than the page that was
   // already on screen before them.

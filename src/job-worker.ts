@@ -39,6 +39,7 @@ export interface WorkerScraper {
     destination: unknown,
     marketplace: unknown,
     options?: unknown,
+    reusableContext?: unknown,
   ): Promise<Record<string, unknown>>;
   blockedForSeconds(): number;
   readonly blockReason: string | null;
@@ -94,6 +95,33 @@ export class DurableJobWorker {
   private readonly reclaimIntervalMs: number;
   private readonly workerId: string;
   private readonly logger: Pick<Console, 'log' | 'warn' | 'error'>;
+
+  /**
+   * One browser context per marketplace, reused across every ASIN in this job.
+   *
+   * Context creation and the localisation round-trip (country selection plus
+   * reload) happen ONCE per marketplace rather than once per ASIN. The 4000 ms
+   * access floor is untouched; only the per-item overhead disappears. Contexts
+   * are closed in `finalise` and on any error.
+   */
+  private jobContexts = new Map<string, import('playwright').BrowserContext>();
+
+  private async contextFor(marketplace: import('./marketplaces.js').Marketplace): Promise<import('playwright').BrowserContext> {
+    const existing = this.jobContexts.get(marketplace.id);
+    if (existing) return existing;
+    const browser = await (this.scraper as unknown as { getBrowser(): Promise<import('playwright').Browser> }).getBrowser();
+    const { createLocalizedContext } = await import('./localization.js');
+    const context = await createLocalizedContext(browser, marketplace);
+    this.jobContexts.set(marketplace.id, context);
+    return context;
+  }
+
+  private async releaseContexts(): Promise<void> {
+    for (const context of this.jobContexts.values()) {
+      await context.close().catch(() => undefined);
+    }
+    this.jobContexts.clear();
+  }
 
   private running = false;
   private stopping = false;
@@ -353,7 +381,8 @@ export class DurableJobWorker {
     const destination = destinationForMarketplace(marketplace, job.destinationId);
 
     try {
-      const product = await this.scraper.scrapeProduct(item.asin, destination, marketplace, {});
+      const context = await this.contextFor(marketplace);
+      const product = await this.scraper.scrapeProduct(item.asin, destination, marketplace, {}, context);
 
       // Persist before acknowledging the item. If the worker dies between these
       // two steps the item is retried and the idempotent save replaces the
@@ -422,6 +451,7 @@ export class DurableJobWorker {
 
   /** Mark a drained job complete, refresh its counters, and archive reports. */
   private async finalise(job: ClaimableJob): Promise<void> {
+    await this.releaseContexts();
     await this.store.refreshJobCounts(job.userId, job.jobId);
 
     if (this.storage && this.options.autoArchiveReports !== false) {

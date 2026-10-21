@@ -81,7 +81,7 @@ const MIN_REQUEST_INTERVAL_MS = Number(process.env.SELLERCTRL_INTERVAL_MS ?? 400
  * way to "get past" detection, and it does not guarantee any particular
  * completion time.
  */
-const MAX_EXTRA_INTERVAL_MS = Number(process.env.SELLERCTRL_MAX_EXTRA_INTERVAL_MS ?? 3000);
+const MAX_EXTRA_INTERVAL_MS = Number(process.env.SELLERCTRL_MAX_EXTRA_INTERVAL_MS ?? 1500);
 
 /** Maximum simultaneous page loads. Kept at 1 so requests stay sequential. */
 const MAX_CONCURRENCY = 1;
@@ -352,7 +352,8 @@ export class ScrapeWorker {
   }
 
   /** Lazily launch one shared headless browser, reused across calls. */
-  private async getBrowser(): Promise<Browser> {
+  /** Lazily launch one shared headless browser, reused across calls. */
+  async getBrowser(): Promise<Browser> {
     if (!this.browserPromise) {
       this.browserPromise = chromium.launch({ headless: true }).catch((error: unknown) => {
         this.browserPromise = null;
@@ -582,19 +583,26 @@ export class ScrapeWorker {
   private async withPage<T>(
     marketplace: Marketplace,
     task: (page: Page, context: BrowserContext) => Promise<T>,
+    reusable?: BrowserContext,
   ): Promise<T> {
     const contextStarted = process.hrtime.bigint();
     const browser = await this.getBrowser();
-    // An isolated context PER MARKETPLACE. Nothing is shared, so a delivery
-    // address set for the UK cannot leak onto amazon.ae and price it in pounds.
-    const context = await createLocalizedContext(browser, marketplace);
+    // An isolated context PER MARKETPLACE. When a caller (the job worker) hands
+    // us one it is reused and NOT closed here; cookies and localisation state
+    // persist across ASINs, which is what lets the second product skip the
+    // destination round-trip entirely.
+    const ownsContext = !reusable;
+    const context = reusable ?? (await createLocalizedContext(browser, marketplace));
     const page = await context.newPage();
     recordTiming('context', Number(process.hrtime.bigint() - contextStarted) / 1e6);
     try {
       return await task(page, context);
     } finally {
-      // Always release the context, including on a restriction throw.
-      await context.close().catch(() => undefined);
+      if (ownsContext) {
+        await context.close().catch(() => undefined);
+      } else {
+        await page.close().catch(() => undefined);
+      }
     }
   }
 
@@ -659,6 +667,7 @@ export class ScrapeWorker {
     destination: Destination | null,
     marketplace: Marketplace = getMarketplace(DEFAULT_MARKETPLACE),
     options: ScrapeOptions = {},
+    reusableContext?: BrowserContext,
   ): Promise<ProductWithOffers> {
     const now = new Date();
     this.assertNotBlocked();
@@ -666,7 +675,9 @@ export class ScrapeWorker {
     const productPage = productUrl(marketplace, asin);
     const offersPage = offersUrl(marketplace, asin);
 
-    return this.withPage(marketplace, async (page, context) => {
+    return this.withPage(
+      marketplace,
+      async (page, context) => {
       // --- product detail ---
       // Localised first: the delivery destination and currency preference are
       // applied and the page reloaded BEFORE any price is read, so a UK or US
@@ -903,7 +914,9 @@ export class ScrapeWorker {
           sourceFile: options.sourceFile ?? null,
         },
       } satisfies ProductWithOffers;
-    });
+    },
+      reusableContext,
+    );
   }
 
   /**
