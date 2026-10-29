@@ -32,7 +32,7 @@ import {
   type UploadedFile,
 } from './upload.js';
 import { parseDirectFile, type DirectParseResult } from './direct.js';
-import { rowsForProduct } from './exports.js';
+import { buildExportRows } from './exports.js';
 import { archiveJobReports, readReportForDownload } from './reports.js';
 import { createReportStorage, contentTypeFor, type ReportStorage } from './storage/index.js';
 import {
@@ -603,7 +603,7 @@ export class QueueApi {
     const archived = await archiveJobReports(this.options.store, this.storage, {
       userId: caller.userId,
       jobId,
-      rows: results.flatMap((product) => rowsForProduct(product as never)),
+      rows: buildExportRows(results as never[]),
     });
 
     const renamed = archived.map((r) => ({

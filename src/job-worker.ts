@@ -30,7 +30,7 @@ import type { ReportStorage } from './storage/index.js';
 import { archiveJobReports } from './reports.js';
 import { getMarketplace, type MarketplaceId } from './marketplaces.js';
 import { destinationForMarketplace } from './worker.js';
-import { rowsForProduct } from './exports.js';
+import { buildExportRows } from './exports.js';
 
 /** The slice of the scraper this worker needs, so tests can supply a double. */
 export interface WorkerScraper {
@@ -463,7 +463,7 @@ export class DurableJobWorker {
           const archived = await archiveJobReports(this.store, this.storage, {
             userId: job.userId,
             jobId: job.jobId,
-            rows: results.flatMap((product) => rowsForProduct(product as never)),
+            rows: buildExportRows(results as never[]),
           });
           const available = archived.filter((r) => r.status === 'AVAILABLE').length;
           this.logger.log(`[worker] job ${job.jobId} archived ${available} report(s)`);

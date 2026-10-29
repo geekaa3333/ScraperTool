@@ -7,7 +7,9 @@ import JSZip from 'jszip';
 
 import {
   EXPORT_COLUMNS,
+  buildExportRows,
   failedRow,
+  resetExportColumns,
   rowsForProduct,
   safeCell,
   toTsv,
@@ -109,21 +111,64 @@ function cell(row, header) {
 // Row generation
 // ---------------------------------------------------------------------------
 
-test('rowsForProduct produces one row per seller offer', () => {
+test('rowsForProduct produces exactly one row per product', () => {
   const rows = rowsForProduct(product('B09LH36816', 5));
-  assert.equal(rows.length, 5, 'ASIN A with 5 offers must yield 5 rows');
+  assert.equal(rows.length, 1, 'one product must yield exactly one row');
   assert.ok(rows.every((r) => r.asin === 'B09LH36816'));
-  assert.equal(rows.filter((r) => r.isBuyBox).length, 1);
 });
 
-test('rowsForProduct repeats product information on every seller row', () => {
-  const rows = rowsForProduct(product('B09LH36816', 3));
-  for (const row of rows) {
-    assert.equal(row.productTitle, 'Test product B09LH36816');
-    assert.equal(row.brand, 'TestBrand');
-    assert.equal(row.currency, 'EGP');
-    assert.equal(row.productUrl, 'https://www.amazon.eg/dp/B09LH36816');
-  }
+test('rowsForProduct places the Buy Box seller in the Buy Box columns', () => {
+  const rows = rowsForProduct(product('B09LH36816', 5));
+  const row = rows[0];
+  // Offer 0 is the Buy Box seller in the test fixture.
+  assert.equal(row.sellerName, 'Seller 0');
+  assert.equal(row.sellerPrice, 100);
+  assert.equal(row.isBuyBox, true);
+});
+
+test('rowsForProduct preserves Amazon seller order in Other Seller columns', () => {
+  resetExportColumns();
+  const rows = rowsForProduct(product('B09LH36816', 4));
+  const row = rows[0];
+  // Offers 1,2,3 are non-Buy Box sellers in original order.
+  assert.equal(row.otherSeller1Name, 'Seller 1');
+  assert.equal(row.otherSeller1Price, 101);
+  assert.equal(row.otherSeller2Name, 'Seller 2');
+  assert.equal(row.otherSeller2Price, 102);
+  assert.equal(row.otherSeller3Name, 'Seller 3');
+  assert.equal(row.otherSeller3Price, 103);
+  // Buy Box seller must NOT appear among the Other Sellers.
+  assert.notEqual(row.otherSeller1Name, 'Seller 0');
+});
+
+test('rowsForProduct pairs each seller name with its own price', () => {
+  const p = product('B09LH36816', 3);
+  // Make prices distinct and out of order to prove pairing, not sorting.
+  p.offers[0].price = 50;
+  p.offers[1].price = 999;
+  p.offers[2].price = 7;
+  p.offers[0].isBuyBox = true;
+  p.offers[1].isBuyBox = false;
+  p.offers[2].isBuyBox = false;
+
+  const row = rowsForProduct(p)[0];
+  assert.equal(row.sellerPrice, 50, 'Buy Box price must match Buy Box seller');
+  assert.equal(row.otherSeller1Name, 'Seller 1');
+  assert.equal(row.otherSeller1Price, 999, 'Other Seller 1 price must match Seller 1');
+  assert.equal(row.otherSeller2Name, 'Seller 2');
+  assert.equal(row.otherSeller2Price, 7, 'Other Seller 2 price must match Seller 2');
+});
+
+test('rowsForProduct handles a product with no Buy Box seller', () => {
+  const p = product('B09LH36816', 3);
+  for (const o of p.offers) o.isBuyBox = false;
+  const row = rowsForProduct(p)[0];
+  assert.equal(row.isBuyBox, false);
+  // All offers become Other Sellers in original order.
+  assert.equal(row.otherSeller1Name, 'Seller 0');
+  assert.equal(row.otherSeller2Name, 'Seller 1');
+  assert.equal(row.otherSeller3Name, 'Seller 2');
+  assert.equal(row.sellerName, 'Seller 0', 'first offer becomes the Buy Box fallback');
 });
 
 test('rowsForProduct emits one row for a product with no offers', () => {
@@ -141,16 +186,44 @@ test('rowsForProduct marks an incomplete seller list rather than reporting succe
       offersCompletenessNote: 'Amazon advertised 9 offers; 2 were readable.',
     }),
   );
-  assert.equal(rows.length, 2);
-  assert.ok(rows.every((r) => r.status === 'INCOMPLETE'), 'must not be reported as OK');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].status, 'INCOMPLETE', 'must not be reported as OK');
   assert.match(rows[0].statusDetail, /advertised 9/);
 });
 
-test('rowsForProduct keeps each seller own delivery values', () => {
+test('rowsForProduct keeps the Buy Box seller delivery values', () => {
   const rows = rowsForProduct(product('B09LH36816', 3));
-  const dates = rows.map((r) => r.estimatedDeliveryDate);
-  assert.deepEqual(dates, ['2026-10-10', '2026-10-11', '2026-10-12']);
-  assert.deepEqual(rows.map((r) => r.deliveryDays), [1, 2, 3]);
+  const row = rows[0];
+  assert.equal(row.estimatedDeliveryDate, '2026-10-10');
+  assert.equal(row.deliveryDays, 1);
+});
+
+test('buildExportRows creates dynamic Other Seller columns for the widest batch', () => {
+  resetExportColumns();
+  const rows = buildExportRows([
+    product('A', 2),
+    product('B', 5),
+    product('C', 1),
+  ]);
+  assert.equal(rows.length, 3, 'one row per product');
+  // 5 offers -> Buy Box + 4 others.
+  const otherHeaders = EXPORT_COLUMNS.map((c) => c.header).filter((h) => /^Other Seller \d+$/.test(h));
+  assert.equal(otherHeaders.length, 4, 'max other sellers = 4 (5 offers minus Buy Box)');
+  assert.deepEqual(otherHeaders, ['Other Seller 1', 'Other Seller 2', 'Other Seller 3', 'Other Seller 4']);
+  // Product B (5 offers) fills all 4 other-seller columns.
+  const bRow = rows.find((r) => r.asin === 'B');
+  assert.equal(bRow.otherSeller4Name, 'Seller 4');
+  // Product C (1 offer) has no other sellers -> blank cells.
+  const cRow = rows.find((r) => r.asin === 'C');
+  assert.equal(cRow.otherSeller1Name, undefined);
+});
+
+test('buildExportRows preserves Amazon seller order across products', () => {
+  resetExportColumns();
+  const rows = buildExportRows([product('X', 4)]);
+  const row = rows[0];
+  const names = [row.otherSeller1Name, row.otherSeller2Name, row.otherSeller3Name];
+  assert.deepEqual(names, ['Seller 1', 'Seller 2', 'Seller 3']);
 });
 
 test('failedRow records the marketplace, ASIN and the reason', () => {
@@ -218,7 +291,7 @@ test('a malicious seller name is neutralised in both exports', async () => {
   const buffer = await toWorkbook(rows);
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(buffer);
-  const value = cell(workbook.getWorksheet(1).getRow(2), 'Seller Name');
+  const value = cell(workbook.getWorksheet(1).getRow(2), 'Seller Name (Buy Box)');
   assert.equal(String(value).charAt(0), "'", 'XLSX cell must be forced to text');
 });
 
@@ -226,10 +299,10 @@ test('a malicious seller name is neutralised in both exports', async () => {
 // TSV
 // ---------------------------------------------------------------------------
 
-test('toTsv emits a header and one tab-separated line per row', () => {
+test('toTsv emits a header and one tab-separated line per product', () => {
   const tsv = toTsv(rowsForProduct(product('B09LH36816', 3)));
   const lines = tsv.split('\n');
-  assert.equal(lines.length, 4, '1 header + 3 seller rows');
+  assert.equal(lines.length, 2, '1 header + 1 product row');
   assert.equal(lines[0].split('\t').length, EXPORT_COLUMNS.length);
   assert.ok(lines[1].includes('B09LH36816'));
 });
@@ -280,8 +353,8 @@ test('toWorkbook puts every seller row in the single sheet', async () => {
   await workbook.xlsx.load(buffer);
   const sheet = workbook.worksheets[0];
 
-  // 15 seller rows + 1 header
-  assert.equal(sheet.rowCount, 16);
+  // 3 product rows + 1 header
+  assert.equal(sheet.rowCount, 4);
 
   const asins = new Set();
   for (let row = 2; row <= sheet.rowCount; row += 1) asins.add(cell(sheet.getRow(row), 'ASIN'));
@@ -305,8 +378,8 @@ test('toWorkbook freezes the header row and enables filters', async () => {
   // EXPORT_COLUMNS so adding a column cannot silently break the range.
   assert.equal(
     filter[1],
-    `A1:${colLetter(EXPORT_COLUMNS.length)}4`,
-    'filter must span the header and all 3 seller rows',
+    `A1:${colLetter(EXPORT_COLUMNS.length)}2`,
+    'filter must span the header and the single product row',
   );
 
   const pane = /<pane[^>]*>/.exec(xml);
@@ -326,10 +399,10 @@ test('toWorkbook writes prices as numeric cells, not text', async () => {
   await workbook.xlsx.load(buffer);
   const row = workbook.worksheets[0].getRow(2);
 
-  assert.equal(typeof cell(row, 'Seller Price'), 'number');
-  assert.equal(typeof cell(row, 'Shipping Cost'), 'number');
-  assert.equal(typeof cell(row, 'Total Price'), 'number');
-  assert.equal(cell(row, 'Seller Price'), 100);
+  assert.equal(typeof cell(row, 'Seller Price (Buy Box)'), 'number');
+  assert.equal(typeof cell(row, 'Shipping Cost (Buy Box)'), 'number');
+  assert.equal(typeof cell(row, 'Total Price (Buy Box)'), 'number');
+  assert.equal(cell(row, 'Seller Price (Buy Box)'), 100);
 });
 
 test('toWorkbook uses the same column names as the TSV header', async () => {
@@ -398,11 +471,18 @@ test('booleans render identically in both formats', async () => {
   const buyBoxColumn = header.indexOf('Buy Box');
 
   assert.equal(tsvLines[1].split('\t')[buyBoxColumn], 'YES', 'the Buy Box row is YES in TSV');
-  assert.equal(tsvLines[2].split('\t')[buyBoxColumn], 'NO');
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(await toWorkbook(rows));
   const sheet = workbook.worksheets[0];
   assert.equal(cell(sheet.getRow(2), 'Buy Box'), 'YES');
-  assert.equal(cell(sheet.getRow(3), 'Buy Box'), 'NO');
+
+  // A product whose Buy Box seller is absent must render NO.
+  const noBuyBox = product('B09LH36816', 2);
+  for (const o of noBuyBox.offers) o.isBuyBox = false;
+  const rows2 = rowsForProduct(noBuyBox);
+  const tsv2 = toTsv(rows2).split('\n');
+  const header2 = tsv2[0].split('\t');
+  const bbCol2 = header2.indexOf('Buy Box');
+  assert.equal(tsv2[1].split('\t')[bbCol2], 'NO', 'a non-Buy-Box product row is NO in TSV');
 });

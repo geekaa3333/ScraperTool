@@ -25,6 +25,14 @@ import { resolveCurrency } from './currency.js';
 export type RowStatus = 'OK' | 'NO_OFFERS' | 'FAILED' | 'INCOMPLETE' | 'NOT_FOUND';
 
 export interface ExportRow {
+  /**
+   * Dynamic seller columns: `otherSeller1Name`, `otherSeller1Price`,
+   * `otherSeller2Name`, `otherSeller2Price`, ... up to the largest number of
+   * other sellers seen in the batch. Declared here as an index signature so
+   * the column count can grow without a fixed upper bound, while the named
+   * fields below keep their precise types.
+   */
+  [sellerColumn: string]: string | number | boolean | null | undefined;
   // --- marketplace provenance (new) ---
   marketplaceId: string;
   /**
@@ -52,8 +60,15 @@ export interface ExportRow {
   // --- product ---
   asin: string;
   productTitle: string | null;
+  /** English title when the marketplace served a different language. */
+  productTitleEn: string | null;
   brand: string | null;
   productUrl: string | null;
+  /** Absolute URL of the product's main image, when Amazon exposed one. */
+  productImageUrl: string | null;
+  /** Embedded image marker. The actual image is written into the XLSX cell by
+   *  `toWorkbook`; TSV has no image column support and leaves this blank. */
+  productImage: string | null;
   /** Numeric where a reliable number was parsed; null when Amazon stated none. */
   productPrice: number | null;
   /** The price exactly as displayed, beside the numeric value. */
@@ -167,7 +182,13 @@ interface Column {
   numeric?: boolean;
 }
 
-export const EXPORT_COLUMNS: Column[] = [
+/**
+ * The fixed columns, in their canonical order. Seller-related columns are
+ * renamed to make the Buy Box seller explicit; the per-product "Other Seller N"
+ * columns are appended at runtime by `buildExportColumns()` because their count
+ * depends on the whole batch, not on any single product.
+ */
+const BASE_COLUMNS: Column[] = [
   // Marketplace first, so a mixed export is readable at a glance and can be
   // filtered per market. Prices stay in their original marketplace currency —
   // this tool never converts currencies.
@@ -183,8 +204,11 @@ export const EXPORT_COLUMNS: Column[] = [
 
   { key: 'asin', header: 'ASIN', width: 14 },
   { key: 'productTitle', header: 'Product Title', width: 46 },
+  { key: 'productTitleEn', header: 'Product Title (English)', width: 46 },
   { key: 'brand', header: 'Brand', width: 18 },
   { key: 'productUrl', header: 'Product URL', width: 40 },
+  { key: 'productImageUrl', header: 'Product Image URL', width: 46 },
+  { key: 'productImage', header: 'Product Image', width: 16 },
   { key: 'productPrice', header: 'Product Price', width: 14, numeric: true },
   { key: 'productPriceText', header: 'Product Price (as displayed)', width: 22 },
   { key: 'productRating', header: 'Product Rating', width: 14 },
@@ -219,16 +243,14 @@ export const EXPORT_COLUMNS: Column[] = [
   { key: 'variationNote', header: 'Variation Note', width: 38 },
   { key: 'variationsComplete', header: 'Variations Complete', width: 18 },
 
-  { key: 'sellerName', header: 'Seller Name', width: 26 },
-  { key: 'sellerId', header: 'Seller ID', width: 16 },
-  { key: 'sellerPrice', header: 'Seller Price', width: 13, numeric: true },
-  { key: 'shippingCost', header: 'Shipping Cost', width: 14, numeric: true },
-  { key: 'totalPrice', header: 'Total Price', width: 13, numeric: true },
-  { key: 'sellerRating', header: 'Seller Rating', width: 13, numeric: true },
-  { key: 'sellerFeedback', header: 'Seller Feedback', width: 15, numeric: true },
-  { key: 'fulfillment', header: 'FBA/FBM', width: 10 },
-  { key: 'productCondition', header: 'Product Condition', width: 17 },
-  { key: 'stockAvailability', header: 'Stock Availability', width: 18 },
+  { key: 'sellerId', header: 'Seller ID (Buy Box)', width: 16 },
+  { key: 'shippingCost', header: 'Shipping Cost (Buy Box)', width: 14, numeric: true },
+  { key: 'totalPrice', header: 'Total Price (Buy Box)', width: 13, numeric: true },
+  { key: 'sellerRating', header: 'Seller Rating (Buy Box)', width: 13, numeric: true },
+  { key: 'sellerFeedback', header: 'Seller Feedback (Buy Box)', width: 15, numeric: true },
+  { key: 'fulfillment', header: 'FBA/FBM (Buy Box)', width: 10 },
+  { key: 'productCondition', header: 'Product Condition (Buy Box)', width: 17 },
+  { key: 'stockAvailability', header: 'Stock Availability (Buy Box)', width: 18 },
   { key: 'isBuyBox', header: 'Buy Box', width: 10 },
 
   { key: 'estimatedDeliveryDate', header: 'Estimated Delivery Date', width: 22 },
@@ -248,6 +270,13 @@ export const EXPORT_COLUMNS: Column[] = [
   { key: 'statusDetail', header: 'Status Detail', width: 44 },
   { key: 'scrapedAt', header: 'Retrieved At (UTC)', width: 22 },
 ];
+
+/**
+ * The live column set. Grows to fit the widest batch seen so far; reset with
+ * `resetExportColumns()` at the start of a new export run if you want it to
+ * reflect only that run.
+ */
+export let EXPORT_COLUMNS: Column[] = [...BASE_COLUMNS];
 
 /**
  * Neutralise spreadsheet formula injection.
@@ -275,8 +304,72 @@ function textOrBlank(value: string | null): string {
   return value === null || value === undefined ? '' : flatten(String(value));
 }
 
+/**
+ * Reset the live column set to the base columns, dropping any "Other Seller N"
+ * columns added by a previous run. Call this between independent export runs
+ * (or in tests) so a smaller batch does not inherit a wider column set.
+ */
+export function resetExportColumns(): void {
+  EXPORT_COLUMNS = [...BASE_COLUMNS];
+}
+
+/**
+ * Ensure the live column set has room for at least `maxOther` other sellers,
+ * appending `Other Seller N` / `Other Seller N Price` pairs as needed. Only
+ * grows; never shrinks or reorders existing columns.
+ */
+let currentMaxOther = 0;
+
+function rebuildExportColumns(maxOther: number): void {
+  currentMaxOther = Math.max(currentMaxOther, maxOther);
+  const sellerBlock: Column[] = [
+    { key: 'sellerName', header: 'Seller Name (Buy Box)', width: 26 },
+    { key: 'sellerPrice', header: 'Seller Price (Buy Box)', width: 13, numeric: true },
+  ];
+  for (let n = 1; n <= currentMaxOther; n += 1) {
+    sellerBlock.push({ key: `otherSeller${n}Name`, header: `Other Seller ${n}`, width: 26 });
+    sellerBlock.push({ key: `otherSeller${n}Price`, header: `Other Seller ${n} Price`, width: 14, numeric: true });
+  }
+  EXPORT_COLUMNS = [...sellerBlock, ...BASE_COLUMNS];
+}
+
+/**
+ * Count other (non-Buy Box) sellers for a product, in Amazon's original order.
+ */
+function otherSellers(product: ProductWithOffers): SellerOffer[] {
+  return product.offers.filter((offer) => !offer.isBuyBox);
+}
+
+/**
+ * The Buy Box seller, if Amazon designated one. Never inferred from price.
+ */
+function buyBoxSeller(product: ProductWithOffers): SellerOffer | null {
+  return product.offers.find((offer) => offer.isBuyBox) ?? null;
+}
+
+/**
+ * Build export rows for a batch of products.
+ *
+ * One row per product. The Buy Box seller lands in the dedicated Buy Box
+ * columns; every other seller keeps Amazon's listing order in the
+ * `Other Seller N` / `Other Seller N Price` columns. The column set grows to
+ * fit the widest batch, so a product with fewer sellers simply leaves the
+ * trailing cells blank.
+ */
+export function buildExportRows(products: ProductWithOffers[]): ExportRow[] {
+  resetExportColumns();
+  const maxOther = products.reduce((acc, p) => Math.max(acc, otherSellers(p).length), 0);
+  rebuildExportColumns(maxOther);
+
+  return products.map((product) => {
+    const built = rowsForProduct(product, maxOther);
+    // rowsForProduct always emits exactly one row per product.
+    return built[0] as ExportRow;
+  });
+}
+
 /** Build the export rows for one scraped product. */
-export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
+export function rowsForProduct(product: ProductWithOffers, maxOtherSellers?: number): ExportRow[] {
   // STRICT lookup, deliberately. `getMarketplace` falls back to amazon.eg, which
   // would relabel an unrecognised marketplace's prices as EGP — the exact bug
   // this replaced. An unknown marketplace leaves the currency blank and marked
@@ -293,8 +386,11 @@ export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
     // Verbatim, exactly as Amazon rendered it — never translated.
     asin: product.asin,
     productTitle: product.title,
+    productTitleEn: product.titleEn ?? null,
     brand: product.brand,
     productUrl: product.url,
+    productImageUrl: product.image ?? null,
+    productImage: null,
     // Numeric so Excel can sort and sum, with the verbatim string beside it
     // as the proof of what Amazon printed.
     productPrice: product.price,
@@ -323,6 +419,15 @@ export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
     // Set per offer; declared here so the shared base type is complete.
     deliveryStatus: null,
   };
+
+  // Grow the column set to fit this product's sellers, even when called
+  // directly (single-product exports, tests). buildExportRows() does this for
+  // the whole batch first, so the common path is a no-op here.
+  const others = otherSellers(product);
+  const maxOther = maxOtherSellers ?? others.length;
+  rebuildExportColumns(maxOther);
+
+  const bb = buyBoxSeller(product);
 
   // A product with no offers still gets a row, so the ASIN is never silently
   // dropped from the export and the reason stays visible.
@@ -356,7 +461,41 @@ export function rowsForProduct(product: ProductWithOffers): ExportRow[] {
     ];
   }
 
-  return product.offers.map((offer) => rowForOffer(base, offer, product));
+  // One row per product. Buy Box seller in the dedicated columns; every other
+  // seller keeps Amazon's listing order in the Other Seller N / Price columns.
+  const row: ExportRow = {
+    ...base,
+    // Buy Box seller (or the first offer when Amazon designated none).
+    sellerName: (bb ?? product.offers[0]!).sellerName,
+    sellerId: (bb ?? product.offers[0]!).sellerId,
+    sellerPrice: (bb ?? product.offers[0]!).price,
+    shippingCost: (bb ?? product.offers[0]!).shippingFee,
+    totalPrice: (bb ?? product.offers[0]!).totalPrice,
+    sellerRating: (bb ?? product.offers[0]!).rating,
+    sellerFeedback: (bb ?? product.offers[0]!).feedbackCount,
+    fulfillment: (bb ?? product.offers[0]!).fulfillment === 'UNKNOWN' ? null : (bb ?? product.offers[0]!).fulfillment,
+    productCondition: (bb ?? product.offers[0]!).condition,
+    stockAvailability: (bb ?? product.offers[0]!).availability,
+    isBuyBox: bb !== null,
+    estimatedDeliveryDate: (bb ?? product.offers[0]!).delivery?.estimatedDate ?? null,
+    earliestDeliveryDate: (bb ?? product.offers[0]!).delivery?.earliestDate ?? null,
+    latestDeliveryDate: (bb ?? product.offers[0]!).delivery?.latestDate ?? null,
+    deliveryDays: (bb ?? product.offers[0]!).delivery?.estimatedDays ?? null,
+    deliveryDestination: (bb ?? product.offers[0]!).delivery?.destination ?? product.destination?.label ?? null,
+    deliveryText: (bb ?? product.offers[0]!).delivery?.originalText ?? null,
+    deliveryStatus: (bb ?? product.offers[0]!).deliveryStatus ?? (bb ?? product.offers[0]!).delivery?.unavailableReason ?? null,
+    status: product.offersComplete ? 'OK' : 'INCOMPLETE',
+    statusDetail: product.offersComplete ? null : product.offersCompletenessNote,
+  };
+
+  // Other sellers, in Amazon's original order, excluding the Buy Box seller.
+  others.forEach((offer, index) => {
+    const n = index + 1;
+    row[`otherSeller${n}Name`] = offer.sellerName;
+    row[`otherSeller${n}Price`] = offer.price;
+  });
+
+  return [row];
 }
 
 /** Describe how strongly the marketplace was established, in plain words. */
@@ -382,51 +521,6 @@ function describeVerification(status: string, method: string): string {
   }
 }
 
-/** Build the export row for a single seller offer. */
-function rowForOffer(
-  base: Omit<
-    ExportRow,
-    | 'sellerName' | 'sellerId' | 'sellerPrice' | 'shippingCost' | 'totalPrice'
-    | 'sellerRating' | 'sellerFeedback' | 'fulfillment' | 'productCondition'
-    | 'stockAvailability' | 'isBuyBox' | 'estimatedDeliveryDate' | 'earliestDeliveryDate'
-    | 'latestDeliveryDate' | 'deliveryDays' | 'deliveryDestination' | 'deliveryText'
-    | 'status' | 'statusDetail'
-  >,
-  offer: SellerOffer,
-  product: ProductWithOffers,
-): ExportRow {
-  const delivery = offer.delivery;
-
-  // `INCOMPLETE` means data was retrieved but Amazon withheld part of the list,
-  // which must never be presented as a complete success.
-  const status: RowStatus = product.offersComplete ? 'OK' : 'INCOMPLETE';
-
-  return {
-    ...base,
-    sellerName: offer.sellerName,
-    sellerId: offer.sellerId,
-    sellerPrice: offer.price,
-    shippingCost: offer.shippingFee,
-    totalPrice: offer.totalPrice,
-    sellerRating: offer.rating,
-    sellerFeedback: offer.feedbackCount,
-    fulfillment: offer.fulfillment === 'UNKNOWN' ? null : offer.fulfillment,
-    productCondition: offer.condition,
-    stockAvailability: offer.availability,
-    isBuyBox: offer.isBuyBox,
-    estimatedDeliveryDate: delivery?.estimatedDate ?? null,
-    earliestDeliveryDate: delivery?.earliestDate ?? null,
-    latestDeliveryDate: delivery?.latestDate ?? null,
-    deliveryDays: delivery?.estimatedDays ?? null,
-    deliveryDestination: delivery?.destination ?? product.destination?.label ?? null,
-    deliveryText: delivery?.originalText ?? null,
-    // Falls back to the offer's own recorded status, so a row with no delivery
-    // block says so rather than staying blank for no stated reason.
-    deliveryStatus: offer.deliveryStatus ?? delivery?.unavailableReason ?? null,
-    status,
-    statusDetail: product.offersComplete ? null : product.offersCompletenessNote,
-  };
-}
 
 /**
  * Page-message columns for one product record.
@@ -542,8 +636,11 @@ export function failedRow(
     sourceFile: null,
     asin,
     productTitle: null,
+    productTitleEn: null,
     brand: null,
     productUrl: null,
+    productImageUrl: null,
+    productImage: null,
     productPrice: null,
     productPriceText: null,
     productRating: null,
@@ -694,6 +791,50 @@ export async function toWorkbook(rows: Iterable<ExportRow>): Promise<Buffer> {
         }),
       ),
     );
+  }
+
+  // Best-effort embedded thumbnails. Downloaded with a short timeout and a
+  // small concurrency cap; a broken or unreachable URL simply leaves the
+  // "Product Image" cell blank — the URL column still carries the link.
+  const imageColumnIndex = EXPORT_COLUMNS.findIndex((column) => column.key === 'productImage');
+  const imageUrlColumnIndex = EXPORT_COLUMNS.findIndex((column) => column.key === 'productImageUrl');
+  if (imageColumnIndex >= 0 && imageUrlColumnIndex >= 0 && rowCount > 0) {
+    const imageCol = imageColumnIndex + 1; // 1-based for ExcelJS
+    const urlCol = imageUrlColumnIndex + 1;
+    const tasks: Promise<void>[] = [];
+    for (let r = 2; r <= rowCount + 1; r += 1) {
+      const row = sheet.getRow(r);
+      const url = String(row.getCell(urlCol).value ?? '').trim();
+      if (!url) continue;
+      const rowIndex = r;
+      tasks.push((async () => {
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 8000);
+          const response = await fetch(url, { signal: controller.signal });
+          clearTimeout(timer);
+          if (!response.ok) return;
+          const buffer = Buffer.from(await response.arrayBuffer()) as any;
+          if (buffer.length === 0 || buffer.length > 4_000_000) return;
+          const extension = (response.headers.get('content-type') ?? '').toLowerCase().includes('png')
+            ? 'png'
+            : 'jpeg';
+          const imageId = workbook.addImage({ buffer, extension });
+          sheet.addImage(imageId, {
+            tl: { col: imageCol - 1, row: rowIndex - 1 },
+            ext: { width: 64, height: 64 },
+          });
+          sheet.getRow(rowIndex).height = 52;
+        } catch {
+          // Skip unreachable/broken images; the URL column still carries the link.
+        }
+      })());
+    }
+    // Cap concurrency so a large batch does not open hundreds of sockets.
+    const concurrency = 6;
+    for (let i = 0; i < tasks.length; i += concurrency) {
+      await Promise.all(tasks.slice(i, i + concurrency));
+    }
   }
 
   // Filters across the whole header, so the reader can slice by any column.

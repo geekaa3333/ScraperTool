@@ -435,10 +435,13 @@ test('a confirmed product with no visible offers still exports one row', () => {
   assert.equal(rows[0].currency, 'EGP', 'currency stays accurate');
 });
 
-test('each seller offer remains its own row', () => {
+test('each seller offer is preserved on the single product row', () => {
   const rows = rowsForProduct(product('B000000001', 'eg', 5));
-  assert.equal(rows.length, 5);
-  assert.equal(new Set(rows.map((r) => r.sellerId)).size, 5);
+  assert.equal(rows.length, 1, 'one row per product, not one per seller');
+  const row = rows[0];
+  // Buy Box seller + 4 other sellers, all five names present.
+  const names = [row.sellerName, row.otherSeller1Name, row.otherSeller2Name, row.otherSeller3Name, row.otherSeller4Name];
+  assert.equal(new Set(names.filter(Boolean)).size, 5, 'all 5 sellers must be present');
 });
 
 test('an incomplete offer list is still exported with its INCOMPLETE status', () => {
@@ -446,8 +449,8 @@ test('an incomplete offer list is still exported with its INCOMPLETE status', ()
   incomplete.offersComplete = false;
   incomplete.offersCompletenessNote = 'Offer list could not be verified as complete.';
   const rows = rowsForProduct(incomplete);
-  assert.equal(rows.length, 2, 'available offers are not discarded');
-  assert.ok(rows.every((r) => r.status === 'INCOMPLETE'));
+  assert.equal(rows.length, 1, 'one row per product');
+  assert.equal(rows[0].status, 'INCOMPLETE', 'available offers are not discarded');
 });
 
 test('negative outcomes remain available as a separate diagnostics dataset', async () => {

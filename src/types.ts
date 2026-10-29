@@ -48,6 +48,12 @@ export interface SearchProduct {
   /** Review count as displayed, e.g. `1,234`. */
   reviewCount: string | null;
   image: string | null;
+  /**
+   * English product title when the marketplace served a different language.
+   * Populated best-effort from a supported API provider so the export can be
+   * searched in English even when Amazon served Arabic. Null when never collected.
+   */
+  titleEn: string | null;
 }
 
 /** Full detail scraped from a single product detail page. */

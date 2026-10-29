@@ -10,6 +10,7 @@ import type {
 import {
   parseSearchResults,
   parseProductDetail,
+  searchProducts as searchProductsFn,
   asinFromUrl,
   AmazonScraperError,
 } from './scraper.js';
@@ -612,11 +613,9 @@ export class ScrapeWorker {
     maxResults = 10,
     marketplace: Marketplace = getMarketplace(DEFAULT_MARKETPLACE),
   ): Promise<SearchProduct[]> {
-    const url = searchUrl(marketplace, query.trim());
-    const html = await this.withPage(marketplace, (page, _context) =>
-      this.fetchHtml(page, url, SEARCH_READY_SELECTOR),
-    );
-    return parseSearchResults(html, maxResults, marketplace);
+    // SerpApi-backed (no 503 from datacenter IPs). Falls back to direct
+    // scraping inside searchProducts when no key is configured.
+    return searchProductsFn(query, maxResults, marketplace);
   }
 
   /**
@@ -693,6 +692,29 @@ export class ScrapeWorker {
       const product = parseProductDetail(productHtml, asin, marketplace);
       recordTiming('product-parse', Number(process.hrtime.bigint() - parseStarted) / 1e6);
 
+      // --- English title (best-effort) ---
+      // Amazon serves arabic.eg in Arabic; an English title lets the user
+      // search the export sheet in English. Fetched from a supported API
+      // provider so it works even when direct scraping is blocked.
+      if (!product.titleEn && process.env.SERPAPI_API_KEY) {
+        try {
+          const url = new URL('https://serpapi.com/search');
+          url.searchParams.set('engine', 'amazon_product');
+          url.searchParams.set('asin', asin);
+          url.searchParams.set('amazon_domain', marketplace.domain);
+          url.searchParams.set('language', 'en_AE');
+          url.searchParams.set('api_key', process.env.SERPAPI_API_KEY);
+          const res = await fetch(url.toString(), { signal: AbortSignal.timeout(15000) });
+          if (res.ok) {
+            const data = (await res.json()) as { product_results?: { title?: string } };
+            const en = data.product_results?.title;
+            if (en && en.trim()) product.titleEn = en.trim();
+          }
+        } catch {
+          // Best-effort only.
+        }
+      }
+
       // --- buy box seller, learned from the product page ---
       let buyBoxSellerId: string | null = null;
       let buyBoxSellerName: string | null = null;
@@ -712,15 +734,33 @@ export class ScrapeWorker {
           '#merchantInfoFeature_feature_div',
         ]) {
           const text = $(selector).first().text().replace(/\s+/g, ' ').trim();
-          if (text && !/^amazon(\.[a-z.]+)?$/i.test(text)) {
-            buyBoxSellerName = text;
+          if (!text) continue;
+
+          // Prefer "Sold by X" over raw text so Amazon is recognised when it is
+          // the seller, while a "Ships from Amazon, Sold by X" page resolves
+          // to X. Raw text is only used when it is not a "ships from" placeholder.
+          const soldByMatch =
+            /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by)\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:rated|rating)\b|$)/i.exec(
+              text,
+            );
+          let name = soldByMatch?.[1]?.replace(/\s+/g, ' ').trim() ?? null;
+          if (!name && !/^ships\s+from\b/i.test(text)) name = text;
+
+          if (name) {
+            buyBoxSellerName = name;
             break;
           }
         }
 
-        const sellerLink = $('a[href*="seller="]').first().attr('href');
-        const idMatch = sellerLink ? /[?&]seller=([A-Z0-9]{6,20})/i.exec(sellerLink) : null;
-        if (idMatch?.[1]) buyBoxSellerId = idMatch[1].toUpperCase();
+        // Scan every seller= link, not just the first — the first is often a
+        // shipping-rates link that lacks the flag.
+        const sellerLinks = $('a[href*="seller="]')
+          .toArray()
+          .map((el) => $(el).attr('href') ?? '');
+        const idMatch = sellerLinks
+          .map((href) => /[?&]seller=([A-Z0-9]{6,20})/i.exec(href)?.[1])
+          .find((id) => id !== undefined);
+        if (idMatch) buyBoxSellerId = idMatch.toUpperCase();
 
         // Buy Box delivery text, kept separate so it is never copied to a
         // seller that showed nothing of its own.

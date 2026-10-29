@@ -16,7 +16,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { SessionUser } from './store.js';
 import type { DataStore } from './store-contract.js';
 import { archiveJobReports, readReportForDownload, signedReportUrl } from '../reports.js';
-import { rowsForProduct } from '../exports.js';
+import { buildExportRows } from '../exports.js';
 import type { ReportStorage } from '../storage/index.js';
 import { createReportStorage } from '../storage/index.js';
 import {
@@ -367,7 +367,7 @@ export class AuthLayer {
     const archived = await archiveJobReports(this.store, this.storage, {
       userId: user.userId,
       jobId,
-      rows: results.flatMap((product) => rowsForProduct(product as never)),
+      rows: buildExportRows(results as never[]),
     });
 
     return {

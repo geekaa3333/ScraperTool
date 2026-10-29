@@ -80,6 +80,59 @@ server.registerTool(
 );
 
 server.registerTool(
+  'search_asins',
+  {
+    title: 'Search Amazon — Extract ASINs',
+    description:
+      'Search Amazon by product name / keyword and return the ASIN (and title) of every matching ' +
+      'product. Use this when you need ASINs for a product name before scraping detail pages. ' +
+      'Marketplace is fixed by the AMAZON_DOMAIN environment variable (default amazon.com).',
+    inputSchema: {
+      query: z.string().min(1).describe('Product name or search terms, e.g. "Boka toothpaste" or "usb c hub"'),
+      max_results: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe('Maximum number of ASINs to return (1-50, default 10)'),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  async ({ query, max_results }) => {
+    try {
+      const products = await searchProducts(query, max_results ?? 10);
+
+      if (products.length === 0) {
+        return {
+          content: [
+            { type: 'text', text: `No products found for "${query}". Try a broader or differently-worded query.` },
+          ],
+        };
+      }
+
+      const asins = products.map((p) => p.asin);
+      const lines = products.map((p, i) => `${i + 1}. ${p.asin} — ${p.title}`);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text:
+              `Found ${products.length} ASIN(s) for "${query}":\n\n` +
+              lines.join('\n') +
+              `\n\nASINs (comma-separated): ${asins.join(', ')}` +
+              `\n\nASINs (one per line):\n${asins.join('\n')}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return toolError(error);
+    }
+  },
+);
+
+server.registerTool(
   'scrape_product',
   {
     title: 'Scrape Amazon Product',

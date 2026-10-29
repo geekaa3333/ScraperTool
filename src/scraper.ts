@@ -256,6 +256,7 @@ export function parseSearchResults(
         'a[href*="customerReviews"] .a-size-base',
       ]),
       image: pickAttr(find, ['img.s-image', 'img'], 'src'),
+      titleEn: null,
     });
   });
 
@@ -442,6 +443,7 @@ export function parseProductDetail(
       '#feature-bullets ~ div #productDescription',
     ]),
     image: pickAttr($, ['#landingImage', '#imgTagWrapperId img', '#main-image'], 'src'),
+    titleEn: null,
     domain: marketplace.domain,
     // What the page printed wins over the marketplace's own currency, and a
     // disagreement is preserved rather than corrected — relabelling it would
@@ -470,6 +472,26 @@ export function parseProductDetail(
  * @param maxResults   Upper bound on returned products (1-50, default 10).
  * @param marketplace  Marketplace to search. Defaults to the legacy one.
  */
+/**
+ * Map a marketplace domain to a SerpApi language code so search results come
+ * back in English even when the marketplace's native language is Arabic.
+ */
+function serpApiLanguage(domain: string): string {
+  switch (domain) {
+    case 'amazon.eg':
+    case 'amazon.ae':
+    case 'amazon.sa':
+      return 'en_AE';
+    case 'amazon.co.uk':
+      return 'en_GB';
+    case 'amazon.ca':
+      return 'en_CA';
+    case 'amazon.com':
+    default:
+      return 'en_US';
+  }
+}
+
 export async function searchProducts(
   query: string,
   maxResults = 10,
@@ -481,6 +503,58 @@ export async function searchProducts(
   }
 
   const limit = Math.min(Math.max(Math.trunc(maxResults) || 10, 1), 50);
+
+  // Prefer SerpApi (a supported API provider) over scraping Amazon's search
+  // page directly: Amazon returns 503 to most datacenter IPs, and SerpApi
+  // returns the same results without that restriction. Fall back to direct
+  // scraping only when no key is configured.
+  const apiKey = process.env.SERPAPI_API_KEY;
+  if (apiKey) {
+    try {
+      const url = new URL('https://serpapi.com/search');
+      url.searchParams.set('engine', 'amazon');
+      url.searchParams.set('k', trimmedQuery);
+      url.searchParams.set('amazon_domain', marketplace.domain);
+      url.searchParams.set('language', serpApiLanguage(marketplace.domain));
+      url.searchParams.set('api_key', apiKey);
+      const res = await fetch(url.toString(), { signal: AbortSignal.timeout(30000) });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          organic_results?: Array<{
+            asin?: string;
+            title?: string;
+            link?: string;
+            thumbnail?: string;
+            price?: string;
+            rating?: number;
+            reviews?: number;
+          }>;
+        };
+        const results = Array.isArray(data.organic_results) ? data.organic_results : [];
+        const out: SearchProduct[] = [];
+        const seen = new Set<string>();
+        for (const r of results) {
+          if (!r?.asin || seen.has(r.asin)) continue;
+          seen.add(r.asin);
+          out.push({
+            asin: r.asin.toUpperCase(),
+            title: r.title ?? `ASIN ${r.asin}`,
+            url: r.link ?? `https://www.${marketplace.domain}/dp/${r.asin}`,
+            price: r.price ?? null,
+            rating: r.rating != null ? `${r.rating} out of 5 stars` : null,
+            reviewCount: r.reviews != null ? String(r.reviews) : null,
+            image: r.thumbnail ?? null,
+            titleEn: r.title ?? null,
+          });
+          if (out.length >= limit) break;
+        }
+        if (out.length > 0) return out;
+      }
+    } catch {
+      // Fall through to direct scraping.
+    }
+  }
+
   const url = buildSearchUrl(marketplace, trimmedQuery);
 
   const browser = await getBrowser();

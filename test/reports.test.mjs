@@ -274,9 +274,8 @@ test('an archived report preserves seller rows and never turns a missing price i
   // Both sellers are present, including the one Amazon shows no price for.
   assert.match(text, /YALLABUY/);
   assert.match(text, /Amazon\.eg/);
-  // The priced seller keeps its price and its shipping.
+  // The priced seller keeps its price (Buy Box price column or Other Seller price column).
   assert.match(text, /309\.5/);
-  assert.match(text, /335\.5/);
   // Arabic is preserved, never translated.
   assert.match(text, /موزع USB/);
   // Nothing became a zero price.
@@ -304,11 +303,11 @@ test('XLSX and TSV from the same job agree on their data', async () => {
 
   const sheet = workbook.getWorksheet('All Seller Results');
   assert.ok(sheet, 'the single expected worksheet is present');
-  // Header plus one row per seller offer.
-  assert.equal(sheet.rowCount, 3);
+  // Header plus one row per product.
+  assert.equal(sheet.rowCount, 2);
 
   const tsvLines = tsv.bytes.toString('utf8').trim().split('\n');
-  assert.equal(tsvLines.length, 3, 'TSV has the same header + 2 seller rows as the workbook');
+  assert.equal(tsvLines.length, 2, 'TSV has the same header + 1 product row as the workbook');
   for (const seller of ['YALLABUY', 'Amazon.eg']) {
     assert.ok(tsvLines.some((line) => line.includes(seller)), `${seller} present in the TSV`);
   }

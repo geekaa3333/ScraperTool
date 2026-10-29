@@ -232,6 +232,8 @@ export class SqliteStore implements DataStore {
       ['seller_offers', 'delivery_original_text', 'TEXT'],
       ['seller_offers', 'positive_percent_source', 'TEXT'],
       ['product_snapshots', 'currency_status', 'TEXT'],
+      ['product_snapshots', 'image', 'TEXT'],
+      ['product_snapshots', 'title_en', 'TEXT'],
       // What the page said, as distinct from what was merely absent.
       ['product_snapshots', 'availability_status', 'TEXT'],
       ['product_snapshots', 'availability_message', 'TEXT'],
@@ -1240,9 +1242,10 @@ export class SqliteStore implements DataStore {
                                            requested_asin, variation_asin, variation_attributes_json,
                                            variation_note, variations_complete, buying_options_opened,
                                            price_source, price_selector, price_basis_only,
-                                           price_rejected_json)
+                                           price_rejected_json, title_en)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                                                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                                                   ?)
            ON CONFLICT (job_id, marketplace_id, asin) DO UPDATE SET
              title = excluded.title,
              brand = excluded.brand,
@@ -1283,7 +1286,8 @@ export class SqliteStore implements DataStore {
              price_source = excluded.price_source,
              price_selector = excluded.price_selector,
              price_basis_only = excluded.price_basis_only,
-             price_rejected_json = excluded.price_rejected_json`,
+             price_rejected_json = excluded.price_rejected_json,
+             title_en = excluded.title_en`,
         )
         .run(
           snapshotId,
@@ -1335,6 +1339,7 @@ export class SqliteStore implements DataStore {
           (product.priceSelector as string) ?? null,
           product.priceBasisPriceOnly === undefined ? null : boolInt(product.priceBasisPriceOnly),
           json(product.priceRejected ?? []),
+          (product.titleEn as string) ?? null,
         );
 
       // ON CONFLICT DO UPDATE assigns to `excluded.snapshot_id`, so the id is
@@ -1413,7 +1418,7 @@ export class SqliteStore implements DataStore {
   async loadJobResults(userId: string, jobId: string): Promise<Array<Record<string, unknown>>> {
     const snapshots = this.db
       .prepare(
-        `SELECT snapshot_id, asin, marketplace_id, title, brand, price_text, price, currency,
+        `SELECT snapshot_id, asin, marketplace_id, title, title_en, brand, image, price_text, price, currency,
                 domain, rating_text, review_count, availability, features, destination,
                 provenance, offers_total_count, offers_complete, offers_completeness_note,
                 scraped_at, currency_status
@@ -1451,7 +1456,8 @@ export class SqliteStore implements DataStore {
         rating: snapshot.rating_text ?? null,
         reviewCount: snapshot.review_count ?? null,
         availability: snapshot.availability ?? null,
-        image: null,
+        image: snapshot.image ?? null,
+        titleEn: snapshot.title_en ?? null,
         features: safeJson(snapshot.features, []),
         description: null,
         domain: snapshot.domain ?? null,

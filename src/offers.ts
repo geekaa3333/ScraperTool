@@ -334,12 +334,20 @@ function parseSellerBlock(text: string, href: string | undefined): {
   // Seller name: "sold by X" / "يُباع من X" / "بائعه X".
   // The optional `(?:من\s+)?` absorbs the preposition so the capture starts at
   // the name; without it the name came back as "من The.Value.Store".
-  const nameMatch =
-    /(?:sold\s+by|ships\s+from)\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:rated|rating|تقييم)\b|$)/i.exec(
+  // Prefer "Sold by X" over "Ships from X": the latter is fulfilment, not
+  // ownership. Only fall back to "ships from" when no "sold by" is present.
+  const soldByMatch =
+    /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by)\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:rated|rating|تقييم)\b|$)/i.exec(
       text,
     ) ??
-    /(?:يُباع|يباع|ياع)\s+(?:من\s+)?([^،,()]+?)(?=\s*(?:تقييم|،|,)|$)/.exec(text) ??
+    /(?:يُباع|يباع)\s+(?:من\s+)?([^،,()]+?)(?=\s*(?:تقييم|،|,)|$)/.exec(text) ??
     /(?:بائعه|بائعته)\s+([^،,()]+?)(?=\s*(?:تقييم|،|,)|$)/.exec(text);
+
+  const shipsFromMatch = /ships\s+from\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:rated|rating|تقييم)\b|$)/i.exec(
+    text,
+  );
+
+  const nameMatch = soldByMatch ?? shipsFromMatch;
 
   const name = clean(nameMatch?.[1]?.replace(/\s+/g, ' '));
 
@@ -710,7 +718,11 @@ export function parseOffers(
     // marketplace, and that row carries a real price; applying this guard to
     // every row silently discarded the Amazon-as-seller offer along with it.
     if (pinned && !sellerId && sellerName && /^amazon(\.[a-z.]+)?$/i.test(sellerName.trim())) {
-      continue;
+      // Drop only when Amazon is the fulfilment origin, not the named seller.
+      const soldByAmazon = /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by|يُباع\s+من|يباع\s+من|بائعه)\s+(?:by\s+)?amazon/i.test(
+        blockText,
+      );
+      if (!soldByAmazon) continue;
     }
 
     // Skip true duplicates (same seller listed twice) but keep distinct offers.

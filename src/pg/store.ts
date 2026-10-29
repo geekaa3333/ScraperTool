@@ -1084,10 +1084,10 @@ export class PostgresStore implements DataStore {
                                        requested_asin, variation_asin, variation_attributes,
                                        variation_note, variations_complete, buying_options_opened,
                                        price_source, price_selector, price_basis_only,
-                                       price_rejected)
+                                       price_rejected, title_en)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,
                $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,
-               $40,$41,$42,$43)
+               $40,$41,$42,$43,$44)
        RETURNING snapshot_id`,
       [
         userId, jobId,
@@ -1132,6 +1132,7 @@ export class PostgresStore implements DataStore {
         (product.priceSelector as string) ?? null,
         product.priceBasisPriceOnly === undefined ? null : Boolean(product.priceBasisPriceOnly),
         JSON.stringify(product.priceRejected ?? []),
+        product.titleEn ?? null,
       ],
     );
     const snapshotId = first(rows, 'saveResult').snapshot_id;
@@ -1196,7 +1197,7 @@ export class PostgresStore implements DataStore {
    */
   async loadJobResults(userId: string, jobId: string): Promise<Array<Record<string, unknown>>> {
     const { rows: snapshots } = await this.db.query(
-      `SELECT snapshot_id, asin, marketplace_id, title, brand, price_text, price, currency,
+      `SELECT snapshot_id, asin, marketplace_id, title, title_en, brand, image, price_text, price, currency,
               domain, rating_text, review_count, availability, features, destination,
               provenance, offers_total_count, offers_complete, offers_completeness_note,
               scraped_at, currency_status
@@ -1232,7 +1233,8 @@ export class PostgresStore implements DataStore {
         rating: snapshot.rating_text ?? null,
         reviewCount: snapshot.review_count ?? null,
         availability: snapshot.availability ?? null,
-        image: null,
+        image: snapshot.image ?? null,
+        titleEn: snapshot.title_en ?? null,
         features: safeJson(snapshot.features, []),
         description: null,
         domain: snapshot.domain ?? null,

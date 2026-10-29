@@ -26,8 +26,10 @@ import {
 import { BulkRunner, newJobId } from './jobs.js';
 import {
   detectAsinColumn,
+  detectProductNameColumn,
   detectRegionColumn,
   detectUrlColumn,
+  extractAsin,
   parseAsinColumn,
   parseAsinText,
   parseWorkbookRows,
@@ -140,6 +142,7 @@ async function readWorkbook(
   asinColumn: number | null;
   regionColumn: number | null;
   urlColumn: number | null;
+  productNameColumn: number | null;
   sheetName: string;
 }> {
   const workbook = new ExcelJS.Workbook();
@@ -158,12 +161,59 @@ async function readWorkbook(
   if (rows.length === 0) throw new UploadError('The first sheet is empty');
 
   const headers = rows[0] ?? [];
+  const dataRows = rows.slice(1);
+
+  // Detect columns.
+  let asinColumn = overrides.asinColumn ?? detectAsinColumn(headers);
+  const regionColumn = overrides.regionColumn ?? detectRegionColumn(headers);
+  let urlColumn = overrides.urlColumn ?? detectUrlColumn(headers);
+  const productNameColumn = detectProductNameColumn(headers);
+
+  // If an ASIN column was detected but every cell in it is empty (e.g. a
+  // sheet that carries an "Asin" header with broken/blank formulas), treat it
+  // as absent so product-name resolution can take over instead of failing with
+  // "No valid ASINs found".
+  if (asinColumn !== null && !overrides.asinColumn) {
+    const col = asinColumn as number;
+    // A column only counts as an ASIN column if at least one cell actually
+    // yields a valid ASIN. Sheets that carry an "Asin" header filled with
+    // broken formulas (ExcelJS returns them as {formula, result} objects)
+    // must fall through to product-name resolution instead.
+    const hasAsin = dataRows.some((row) => {
+      const v = row?.[col];
+      if (v === null || v === undefined) return false;
+      const text = typeof v === 'object'
+        ? (v as { hyperlink?: string; text?: string; result?: unknown }).hyperlink
+          ?? (v as { text?: string }).text
+          ?? ''
+        : String(v);
+      return extractAsin(text) !== null;
+    });
+    if (!hasAsin) asinColumn = null;
+  }
+
+  // Same treatment for a URL column: if none of its cells actually yields an
+  // ASIN (e.g. an "Image Link" column that slipped through, or all-blank
+  // cells), drop it so name resolution can take over.
+  if (urlColumn !== null && overrides.urlColumn === undefined) {
+    const col = urlColumn as number;
+    const hasAsin = dataRows.some((row) => {
+      const v = row?.[col];
+      if (v === null || v === undefined) return false;
+      // ExcelJS may store hyperlinks as {text, hyperlink} objects.
+      const text = typeof v === 'object' ? (v as { hyperlink?: string; text?: string }).hyperlink ?? (v as { text?: string }).text ?? '' : String(v);
+      return extractAsin(text) !== null;
+    });
+    if (!hasAsin) urlColumn = null;
+  }
+
   return {
-    rows: rows.slice(1),
+    rows: dataRows,
     headers,
-    asinColumn: overrides.asinColumn ?? detectAsinColumn(headers),
-    regionColumn: overrides.regionColumn ?? detectRegionColumn(headers),
-    urlColumn: overrides.urlColumn ?? detectUrlColumn(headers),
+    asinColumn,
+    regionColumn,
+    urlColumn,
+    productNameColumn,
     sheetName: sheet.name,
   };
 }
@@ -503,14 +553,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
     // No identifier column at all and no manual choice: report the headers so
     // the UI can offer selection instead of silently guessing column A.
-    if (workbook.asinColumn === null && workbook.urlColumn === null) {
+    if (workbook.asinColumn === null && workbook.urlColumn === null && workbook.productNameColumn === null) {
       sendJson(res, 200, {
         needsColumn: true,
         sheetName: workbook.sheetName,
         headers: workbook.headers.map((cell) => (cell === null || cell === undefined ? '' : String(cell))),
         rowCount: workbook.rows.length,
         message:
-          'Could not detect an ASIN or product-URL column. Choose which column holds the identifiers.',
+          'Could not detect an ASIN, product-URL, or product-name column. Choose which column holds the identifiers.',
       });
       return;
     }
@@ -520,16 +570,66 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         ? (marketplaceFromRequest(url.searchParams.get('marketplace')) ?? DEFAULT_MARKETPLACE)
         : null;
 
+    // ---- resolve product names to ASINs when the sheet has no ASIN/URL column ----
+    // The user may upload a workbook of free-text product names. Resolve each
+    // name to its first Amazon search hit so the rest of the pipeline (which is
+    // ASIN-driven) can run unchanged. Best-effort: unresolved names are reported
+    // as invalid rather than crashing the whole upload.
+    let resolvedRows = workbook.rows;
+    let resolvedAsinColumn = workbook.asinColumn;
+    const unresolvedNames: Array<{ rowNumber: number; value: string }> = [];
+    if (workbook.productNameColumn !== null && workbook.asinColumn === null && workbook.urlColumn === null) {
+      const nameCol = workbook.productNameColumn;
+      const marketplace = getMarketplace(fallback ?? DEFAULT_MARKETPLACE);
+      const newRows: unknown[][] = new Array(workbook.rows.length);
+      const unresolved: Array<{ rowNumber: number; value: string }> = [];
+
+      // Resolve names concurrently (5 at a time) to avoid a 221-row upload
+      // taking ~7 minutes sequentially.
+      const CONCURRENCY = 5;
+      const tasks = workbook.rows.map((row, idx) => async () => {
+        const rowNumber = idx + 2;
+        const name = String(row?.[nameCol] ?? '').trim();
+        if (!name) { newRows[idx] = row; return; }
+        let asin: string | null = null;
+        try {
+          const results = await worker.search(name, 1, marketplace);
+          if (Array.isArray(results) && results.length > 0 && results[0]?.asin) {
+            asin = String(results[0].asin).toUpperCase();
+          }
+        } catch {
+          asin = null;
+        }
+        const newRow = Array.isArray(row) ? [...row] : [row];
+        newRow.push(asin);
+        newRows[idx] = newRow;
+        if (!asin) unresolved.push({ rowNumber, value: name });
+      });
+
+      for (let i = 0; i < tasks.length; i += CONCURRENCY) {
+        await Promise.all(tasks.slice(i, i + CONCURRENCY).map((t) => t()));
+      }
+      unresolvedNames.push(...unresolved);
+
+      resolvedRows = newRows;
+      resolvedAsinColumn = newRows.length > 0 ? (newRows[0]?.length ?? 1) - 1 : null;
+    }
+
     const parsed = parseWorkbookRows(
-      workbook.rows,
+      resolvedRows,
       {
-        asinColumn: workbook.asinColumn,
+        asinColumn: resolvedAsinColumn,
         regionColumn: workbook.regionColumn,
-        urlColumn: workbook.urlColumn,
+        urlColumn: null,
+        productNameColumn: null,
       },
       mode,
       fallback,
     );
+
+    if (unresolvedNames.length > 0) {
+      parsed.invalid = [...(parsed.invalid ?? []), ...unresolvedNames];
+    }
 
     if (parsed.rows.length === 0) {
       sendJson(res, 400, {
@@ -670,7 +770,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     // Each pasted line may be a bare ASIN or a full Amazon URL.
     const parsed = parseWorkbookRows(
       (payload.text ?? '').split(/\r?\n/).map((line) => [line]),
-      { asinColumn: 0, regionColumn: null, urlColumn: 0 },
+      { asinColumn: 0, regionColumn: null, urlColumn: 0, productNameColumn: null },
       mode,
       mode === 'single-marketplace' ? marketplaceId : null,
       1,

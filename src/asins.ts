@@ -91,6 +91,26 @@ const REGION_HEADER_HINTS = [
 /** Column header spellings that mean "this column holds full product URLs". */
 const URL_HEADER_HINTS = ['url', 'urls', 'link', 'links', 'product url', 'producturl', 'address'];
 
+/** Headers that contain "link"/"url" but are NOT product URLs (e.g. image links). */
+const URL_HEADER_REJECTED = ['image', 'img', 'photo', 'picture', 'thumbnail', 'icon'];
+
+/** Column header spellings that mean "this column holds free-text product names". */
+const PRODUCT_NAME_HEADER_HINTS = [
+  'product name',
+  'productname',
+  'product title',
+  'producttitle',
+  'name',
+  'title',
+  'query',
+  'search',
+  'search query',
+  'product',
+  'item name',
+  'item title',
+  'description',
+];
+
 /**
  * Pull an ASIN out of a cell value.
  *
@@ -229,8 +249,26 @@ export function detectUrlColumn(headers: unknown[]): number | null {
   for (let index = 0; index < headers.length; index += 1) {
     const header = normalizeHeader(headers[index]);
     if (!header) continue;
+    // "Image Link", "Image URL" etc. are not product URLs.
+    if (URL_HEADER_REJECTED.some((r) => header.includes(r))) continue;
     if (URL_HEADER_HINTS.includes(header)) return index;
     if (URL_HEADER_HINTS.some((hint) => header.includes(hint))) return index;
+  }
+  return null;
+}
+
+/**
+ * Decide which column holds free-text product names.
+ *
+ * Only consulted when no ASIN or URL column was found, so an explicit ASIN
+ * column always wins over a coincidentally named "title" column.
+ */
+export function detectProductNameColumn(headers: unknown[]): number | null {
+  for (let index = 0; index < headers.length; index += 1) {
+    const header = normalizeHeader(headers[index]);
+    if (!header) continue;
+    if (PRODUCT_NAME_HEADER_HINTS.includes(header)) return index;
+    if (PRODUCT_NAME_HEADER_HINTS.some((hint) => header === hint || header.startsWith(`${hint} `))) return index;
   }
   return null;
 }
@@ -311,6 +349,8 @@ export interface WorkbookColumns {
   asinColumn: number | null;
   regionColumn: number | null;
   urlColumn: number | null;
+  /** Column holding free-text product names, resolved to ASINs via search. */
+  productNameColumn: number | null;
 }
 
 /** One input row after column mapping and marketplace resolution. */
