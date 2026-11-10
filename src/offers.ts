@@ -117,6 +117,7 @@ const CURRENCY_TOKENS: Record<MarketplaceId, string[]> = {
   ae: ['aed', 'د.إ', 'د إ', 'درهم', 'dhs'],
   sa: ['ر.س', 'ر س', 'ر.ي', 'sar', 'ريال', 'س.ر', 'srls'],
   uk: ['£', 'gbp'],
+  de: ['€', 'eur', 'euro'],
   // Saudi Riyal symbols were previously listed here; they belong to amazon.sa
   // and never appear on amazon.ca.
   // '$' is listed here so the NUMBER parses on an amazon.ca page that renders a
@@ -193,9 +194,17 @@ function stripBidi(value: string): string {
  */
 export function parsePrice(text: string | null, marketplace: Marketplace = getMarketplace(DEFAULT_MARKETPLACE)): number | null {
   if (!text) return null;
+  // German number format uses a comma as the decimal separator (29,99 €) and a
+  // dot as the thousands separator (1.234,56 €). Normalise to the dot-decimal
+  // form the rest of this function expects, but only when a comma-decimal is
+  // actually present so an already-English "29.99" is left untouched.
+  let input = text;
+  if (marketplace.id === 'de' && /,\\d{1,2}/.test(input)) {
+    input = input.replace(/\\./g, '').replace(/,(\\d{1,2})/g, '.$1');
+  }
   // Normalise digits, separators and bidi marks.
   const normalized = stripBidi(
-    text
+    input
       .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
       .replace(/٫/g, '.')
       .replace(/٬/g, ',')
@@ -250,8 +259,15 @@ export function parsePrice(text: string | null, marketplace: Marketplace = getMa
  */
 export function parsePriceInDisplayedCurrency(text: string | null): number | null {
   if (!text) return null;
+  // German number format: see parsePrice.
+  let input = text;
+  // Marketplace is unknown here, so apply the German rule only when a comma
+  // decimal is present AND no dot-decimal is.
+  if (/,\\d{1,2}/.test(input) && !/\\.\\d{1,2}/.test(input)) {
+    input = input.replace(/\\./g, '').replace(/,(\\d{1,2})/g, '.$1');
+  }
   const normalized = stripBidi(
-    text
+    input
       .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
       .replace(/٫/g, '.')
       .replace(/٬/g, ',')

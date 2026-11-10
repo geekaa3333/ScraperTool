@@ -20,7 +20,7 @@
 
 import type { Destination } from './types.js';
 
-export type MarketplaceId = 'eg' | 'ae' | 'sa' | 'uk' | 'ca' | 'us';
+export type MarketplaceId = 'eg' | 'ae' | 'sa' | 'uk' | 'ca' | 'us' | 'de';
 
 export interface Marketplace {
   /** Stable internal identifier; also the database/cache namespace. */
@@ -261,10 +261,33 @@ export const MARKETPLACES: Record<MarketplaceId, Marketplace> = {
     },
     offersPath: '/gp/offer-listing/',
   },
+  de: {
+    id: 'de',
+    domain: 'amazon.de',
+    label: 'Amazon Germany',
+    country: 'Germany',
+    countryCode: 'DE',
+    deliveryCountryCode: 'DE',
+    currency: 'EUR',
+    currencySymbol: '€',
+    locale: 'en-GB',
+    languages: ['en'],
+    hosts: ['amazon.de', 'www.amazon.de', 'amzn.de', 'www.amzn.de'],
+    cacheNamespace: 'de',
+    defaultDestination: {
+      id: 'berlin',
+      label: 'Berlin, Germany',
+      countryCode: 'DE',
+      amazonLabel: 'Berlin',
+      postalCode: '10115',
+      verified: true,
+    },
+    offersPath: '/gp/offer-listing/',
+  },
 };
 
 /** Stable display order for the UI. */
-export const MARKETPLACE_IDS: MarketplaceId[] = ['eg', 'ae', 'sa', 'uk', 'ca', 'us'];
+export const MARKETPLACE_IDS: MarketplaceId[] = ['eg', 'ae', 'sa', 'uk', 'ca', 'us', 'de'];
 
 export const DEFAULT_MARKETPLACE: MarketplaceId = 'eg';
 
@@ -334,6 +357,7 @@ const REGION_ALIASES: Record<string, MarketplaceId> = {
   ca: 'ca', can: 'ca', canada: 'ca',
   us: 'us', usa: 'us', usa_usa: 'us', 'united states': 'us', 'united states of america': 'us',
   america: 'us', newyork: 'us',
+  de: 'de', deu: 'de', germany: 'de', deutschland: 'de', berlin: 'de', munich: 'de', frankfurt: 'de',
 
   // domains
   'amazon eg': 'eg', 'amazoncom eg': 'eg',
@@ -342,6 +366,7 @@ const REGION_ALIASES: Record<string, MarketplaceId> = {
   'amazoncouk': 'uk', 'amazonuk': 'uk',
   'amazonca': 'ca', 'amazoncomca': 'ca',
   'amazoncom': 'us',
+  'amazon de': 'de', 'amazoncom de': 'de', 'amazondede': 'de',
 };
 
 /**

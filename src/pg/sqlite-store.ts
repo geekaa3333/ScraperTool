@@ -234,6 +234,7 @@ export class SqliteStore implements DataStore {
       ['product_snapshots', 'currency_status', 'TEXT'],
       ['product_snapshots', 'image', 'TEXT'],
       ['product_snapshots', 'title_en', 'TEXT'],
+      ['bulk_jobs', 'selected_fields', 'TEXT'],
       // What the page said, as distinct from what was merely absent.
       ['product_snapshots', 'availability_status', 'TEXT'],
       ['product_snapshots', 'availability_message', 'TEXT'],
@@ -266,6 +267,10 @@ export class SqliteStore implements DataStore {
 
     for (const [table, column, type] of columns) {
       const existing = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      // A table this schema never created (e.g. legacy bulk_jobs tables that
+      // only old single-user databases carry) has an empty PRAGMA result —
+      // skip instead of raising "no such table".
+      if (existing.length === 0) continue;
       if (existing.some((c) => c.name === column)) continue;
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
     }

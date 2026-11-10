@@ -176,7 +176,15 @@ export class BulkRunner {
       const marketplaces = Array.from(
         new Set(unchecked.map((item) => item.marketplaceId)),
       );
-      this.startDetection(jobId, marketplaces);
+      const control: LoopControl = { cancelled: false, phase: 'detect', currentCheck: null };
+      activeLoops.set(jobId, control);
+      this.store.setBulkJobStatus(jobId, 'running');
+      // Interleave detection with scraping: as soon as a marketplace is
+      // confirmed for an ASIN, scrape it immediately instead of waiting for
+      // the whole detection sweep to finish. Saves time on large batches.
+      void this.runInterleaved(jobId, marketplaces, control).finally(() => {
+        activeLoops.delete(jobId);
+      });
       return;
     }
 
@@ -258,6 +266,7 @@ export class BulkRunner {
             originalInput: item.originalInput,
             sourceRow: item.rowNumber,
             sourceFile: item.sourceFile,
+            selectedFields: job.selectedFields ?? undefined,
           },
         );
 
@@ -287,6 +296,147 @@ export class BulkRunner {
     const final = this.store.getBulkJob(jobId);
     if (final && final.pending === 0 && !control.cancelled) {
       this.store.setBulkJobStatus(jobId, 'completed');
+    }
+  }
+
+  /**
+   * Interleaved detection + scraping.
+   *
+   * Instead of waiting for the entire marketplace-detection sweep to finish
+   * before scraping anything, this processes ASINs one at a time: detect all
+   * marketplaces for that ASIN, activate whatever was confirmed, then scrape
+   * every now-pending item before moving on. The user sees seller data appear
+   * while detection is still running, which keeps long batches from feeling
+   * stuck.
+   */
+  private async runInterleaved(
+    jobId: string,
+    marketplaces: MarketplaceId[],
+    control: LoopControl,
+  ): Promise<void> {
+    const job = this.store.getBulkJob(jobId);
+    if (!job) return;
+
+    const asins = Array.from(
+      new Set(
+        this.store
+          .getBulkItems(jobId)
+          .filter((item) => item.detectionStatus === 'NOT_CHECKED')
+          .map((item) => item.asin),
+      ),
+    );
+
+    for (const asin of asins) {
+      if (control.cancelled) {
+        const current = this.store.getBulkJob(jobId);
+        if (current && current.status === 'running') {
+          this.store.setBulkJobStatus(jobId, 'paused');
+        }
+        return;
+      }
+
+      control.phase = 'detect';
+      control.currentCheck = { asin, marketplaceId: (marketplaces[0] ?? 'eg') as MarketplaceId };
+
+      // Detect all marketplaces for THIS asin.
+      const outcomes: Array<{ asin: string; marketplaceId: MarketplaceId; status: string }> = [];
+      for (const marketplaceId of marketplaces) {
+        if (control.cancelled) {
+          const current = this.store.getBulkJob(jobId);
+          if (current && current.status === 'running') this.store.setBulkJobStatus(jobId, 'paused');
+          return;
+        }
+        if (this.worker.blockedForSeconds() > 0) {
+          this.store.setBulkJobStatus(jobId, 'paused', {
+            pausedReason: this.worker.blockReason ?? 'Amazon restricted access during detection.',
+          });
+          return;
+        }
+        control.currentCheck = { asin, marketplaceId };
+        const result = await this.worker.checkAvailability(asin, getMarketplace(marketplaceId));
+        outcomes.push({ asin, marketplaceId, status: result.status });
+        this.store.recordDetection(
+          jobId,
+          marketplaceId,
+          asin,
+          result.status as DetectionStatus,
+          result.status === 'CONFIRMED_NOT_FOUND' ? 'Product page not available in this marketplace.' : null,
+        );
+      }
+
+      // Activate confirmed matches for this asin immediately.
+      const confirmed = outcomes
+        .filter((o) => o.status === 'CONFIRMED_FOUND' || o.status === 'MULTIPLE_MARKETPLACES')
+        .map((o) => ({ marketplaceId: o.marketplaceId, asin: o.asin }));
+      if (confirmed.length > 0) {
+        this.store.activateDetectedItems(jobId, confirmed);
+      }
+
+      // Scrape everything that is now pending (including just-activated items).
+      control.phase = 'scrape';
+      await this.drainPending(jobId, control);
+    }
+
+    // Scrape any remaining pending items (e.g. from a previous partial run).
+    await this.drainPending(jobId, control);
+
+    if (control.cancelled) return;
+    const final = this.store.getBulkJob(jobId);
+    if (final && final.pending === 0) {
+      this.store.setBulkJobStatus(jobId, 'completed');
+    } else if (final && final.pending > 0) {
+      this.store.setBulkJobStatus(jobId, 'paused', {
+        pausedReason: 'Marketplace detection finished. Press Resume to scrape the confirmed matches.',
+      });
+    }
+  }
+
+  /** Drain every currently-pending item for a job. */
+  private async drainPending(jobId: string, control: LoopControl): Promise<void> {
+    for (;;) {
+      if (control.cancelled) {
+        const current = this.store.getBulkJob(jobId);
+        if (current && current.status === 'running') this.store.setBulkJobStatus(jobId, 'paused');
+        return;
+      }
+      const item = this.store.claimNextBulkItem(jobId);
+      if (!item) return;
+
+      if (this.worker.blockedForSeconds() > 0) {
+        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, this.worker.blockReason ?? 'restricted');
+        this.store.setBulkJobStatus(jobId, 'paused', {
+          pausedReason: this.worker.blockReason ?? 'Amazon restricted access.',
+        });
+        return;
+      }
+
+      const marketplace = getMarketplace(item.marketplaceId);
+      const destination = destinationForMarketplace(marketplace, this.store.getBulkJob(jobId)?.destinationId ?? null);
+      control.currentCheck = { asin: item.asin, marketplaceId: item.marketplaceId };
+
+      try {
+        const product = await this.worker.scrapeProduct(item.asin, destination, marketplace, {
+          detectionMethod: item.detectionMethod,
+          detectionStatus: item.detectionStatus as DetectionStatus,
+          originalInput: item.originalInput,
+          sourceRow: item.rowNumber,
+          sourceFile: item.sourceFile,
+          selectedFields: this.store.getBulkJob(jobId)?.selectedFields ?? undefined,
+        });
+        control.currentCheck = null;
+        this.store.completeBulkItem(jobId, product);
+        this.store.save(product);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        control.currentCheck = null;
+        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, reason);
+        if (/captcha|403|429|503|paused|restricted/i.test(reason)) {
+          this.store.setBulkJobStatus(jobId, 'paused', {
+            pausedReason: `${reason} — processing paused.`,
+          });
+          return;
+        }
+      }
     }
   }
 

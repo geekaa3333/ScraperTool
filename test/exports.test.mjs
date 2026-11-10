@@ -328,6 +328,22 @@ test('toTsv flattens tabs and newlines inside scraped text', async () => {
 // XLSX
 // ---------------------------------------------------------------------------
 
+test('toWorkbook creates a Failed sheet for non-OK rows', async () => {
+  const rows = [
+    ...rowsForProduct(product('B09LH36816', 3)),
+    failedRow('eg', 'B002XXXXXX', 'Amazon returned HTTP 429'),
+  ];
+  const buffer = await toWorkbook(rows);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+
+  assert.equal(workbook.worksheets.length, 2, 'main sheet + Failed sheet');
+  assert.equal(workbook.worksheets[0].name, 'All Seller Results');
+  assert.equal(workbook.worksheets[1].name, 'Failed');
+  assert.equal(workbook.worksheets[0].rowCount, 2, '1 OK row + header');
+  assert.equal(workbook.worksheets[1].rowCount, 2, '1 failed row + header');
+});
+
 test('toWorkbook creates exactly ONE worksheet named All Seller Results', async () => {
   const rows = [
     ...rowsForProduct(product('B09LH36816', 5)),
@@ -424,7 +440,6 @@ test('XLSX and TSV contain identical records and values', async () => {
   const rows = [
     ...rowsForProduct(product('B09LH36816', 4)),
     ...rowsForProduct(product('B001XXXXXX', 2)),
-    failedRow('eg', 'B002XXXXXX', 'Amazon returned HTTP 429'),
   ];
 
   const tsv = toTsv(rows);

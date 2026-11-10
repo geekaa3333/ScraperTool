@@ -196,7 +196,8 @@ export class Store {
         created_at       TEXT NOT NULL,
         started_at       TEXT,
         finished_at      TEXT,
-        paused_reason    TEXT
+        paused_reason    TEXT,
+        selected_fields  TEXT
       );
 
       CREATE TABLE IF NOT EXISTS bulk_items (
@@ -415,6 +416,7 @@ export class Store {
   private addMissingColumns(): void {
     const additions: Array<[string, string, string]> = [
       ['bulk_items', 'source_file', 'TEXT'],
+      ['bulk_jobs', 'selected_fields', 'TEXT'],
     ];
     for (const [table, column, type] of additions) {
       const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
@@ -644,11 +646,12 @@ export class Store {
     mode: string;
     sourceName: string | null;
     items: QueueItem[];
+    selectedFields?: string[] | null;
   }): void {
     const now = new Date().toISOString();
     const insertJob = this.db.prepare(
-      `INSERT INTO bulk_jobs (id, status, mode, destination_id, total, source_name, created_at)
-       VALUES (?, 'queued', ?, ?, ?, ?, ?)`,
+      `INSERT INTO bulk_jobs (id, status, mode, destination_id, total, source_name, created_at, selected_fields)
+       VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)`,
     );
     const insertItem = this.db.prepare(
       `INSERT OR IGNORE INTO bulk_items
@@ -658,7 +661,7 @@ export class Store {
     );
 
     const run = this.db.transaction(() => {
-      insertJob.run(input.id, input.mode, input.destinationId, input.items.length, input.sourceName, now);
+      insertJob.run(input.id, input.mode, input.destinationId, input.items.length, input.sourceName, now, JSON.stringify(input.selectedFields ?? null));
       for (const item of input.items) {
         insertItem.run(
           input.id,
@@ -719,6 +722,11 @@ export class Store {
       failed,
       completed: done + failed,
       offers: Number(counts.offers ?? 0),
+      selectedFields: (() => {
+        const raw = job.selected_fields;
+        if (raw === null || raw === undefined) return null;
+        try { const v = JSON.parse(String(raw)); return Array.isArray(v) ? v : null; } catch { return null; }
+      })(),
     };
   }
 
@@ -1341,6 +1349,7 @@ export interface BulkJobRow {
   failed: number;
   completed: number;
   offers: number;
+  selectedFields: string[] | null;
 }
 
 /** One queued unit of work as read back from SQLite. */

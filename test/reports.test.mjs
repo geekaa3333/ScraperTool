@@ -303,8 +303,13 @@ test('XLSX and TSV from the same job agree on their data', async () => {
 
   const sheet = workbook.getWorksheet('All Seller Results');
   assert.ok(sheet, 'the single expected worksheet is present');
-  // Header plus one row per product.
-  assert.equal(sheet.rowCount, 2);
+  // PRODUCT has offersComplete:false (INCOMPLETE). INCOMPLETE rows carry useful
+  // data and stay on the main sheet; only FAILED/NOT_FOUND go to Failed.
+  assert.equal(sheet.rowCount, 2, 'header + 1 INCOMPLETE row on the main sheet');
+
+  const failedSheet = workbook.getWorksheet('Failed');
+  // No FAILED/NOT_FOUND rows in this fixture, so no Failed sheet.
+  assert.equal(failedSheet, undefined, 'no Failed sheet when nothing truly failed');
 
   const tsvLines = tsv.bytes.toString('utf8').trim().split('\n');
   assert.equal(tsvLines.length, 2, 'TSV has the same header + 1 product row as the workbook');

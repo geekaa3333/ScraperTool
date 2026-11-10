@@ -482,6 +482,8 @@ function serpApiLanguage(domain: string): string {
     case 'amazon.ae':
     case 'amazon.sa':
       return 'en_AE';
+    case 'amazon.de':
+      return 'en_GB';
     case 'amazon.co.uk':
       return 'en_GB';
     case 'amazon.ca':

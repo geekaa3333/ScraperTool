@@ -32,7 +32,13 @@ export interface ExportRow {
    * the column count can grow without a fixed upper bound, while the named
    * fields below keep their precise types.
    */
-  [sellerColumn: string]: string | number | boolean | null | undefined;
+  [sellerColumn: string]: string | number | boolean | null | undefined | string[];
+  /**
+   * Requested field ids for this scrape. When present, only the columns mapped
+   * to these fields are emitted. When absent, all columns are emitted
+   * (backward compat).
+   */
+  selectedFields?: string[] | null;
   // --- marketplace provenance (new) ---
   marketplaceId: string;
   /**
@@ -278,6 +284,90 @@ const BASE_COLUMNS: Column[] = [
  */
 export let EXPORT_COLUMNS: Column[] = [...BASE_COLUMNS];
 
+// Map from ExportRow column key -> field id, so we can filter columns by a
+// selected-fields list. Other-seller columns map to "otherSellers".
+const COLUMN_FIELD: Record<string, string> = {};
+for (const f of [
+  { id: 'asin', key: 'asin' },
+  { id: 'title', key: 'productTitle' },
+  { id: 'titleEn', key: 'productTitleEn' },
+  { id: 'image', key: 'productImageUrl' },
+  { id: 'imageEmbedded', key: 'productImage' },
+  { id: 'url', key: 'productUrl' },
+  { id: 'brand', key: 'brand' },
+  { id: 'price', key: 'productPrice' },
+  { id: 'priceText', key: 'productPriceText' },
+  { id: 'currency', key: 'currency' },
+  { id: 'priceSource', key: 'priceSource' },
+  { id: 'priceMissingReason', key: 'priceMissingReason' },
+  { id: 'rating', key: 'productRating' },
+  { id: 'reviewCount', key: 'reviewCount' },
+  { id: 'availability', key: 'productAvailability' },
+  { id: 'availabilityStatus', key: 'availabilityStatus' },
+  { id: 'availabilityMessage', key: 'availabilityMessage' },
+  { id: 'shippingMessage', key: 'shippingMessage' },
+  { id: 'priceWarning', key: 'priceWarning' },
+  { id: 'buyingOptionsMessage', key: 'buyingOptionsMessage' },
+  { id: 'buyBoxSellerName', key: 'sellerName' },
+  { id: 'buyBoxSellerPrice', key: 'sellerPrice' },
+  { id: 'buyBoxSellerId', key: 'sellerId' },
+  { id: 'buyBoxShipping', key: 'shippingCost' },
+  { id: 'buyBoxTotal', key: 'totalPrice' },
+  { id: 'buyBoxRating', key: 'sellerRating' },
+  { id: 'buyBoxFeedback', key: 'sellerFeedback' },
+  { id: 'buyBoxFulfillment', key: 'fulfillment' },
+  { id: 'buyBoxCondition', key: 'productCondition' },
+  { id: 'buyBoxStock', key: 'stockAvailability' },
+  { id: 'isBuyBox', key: 'isBuyBox' },
+  { id: 'deliveryDate', key: 'estimatedDeliveryDate' },
+  { id: 'deliveryDays', key: 'deliveryDays' },
+  { id: 'deliveryText', key: 'deliveryText' },
+  { id: 'deliveryStatus', key: 'deliveryStatus' },
+  { id: 'variationAsin', key: 'variationAsin' },
+  { id: 'variationType', key: 'variationType' },
+  { id: 'selectedSize', key: 'selectedSize' },
+  { id: 'selectedColor', key: 'selectedColor' },
+  { id: 'marketplaceId', key: 'marketplaceId' },
+  { id: 'marketplaceDomain', key: 'marketplaceDomain' },
+  { id: 'country', key: 'country' },
+  { id: 'currency', key: 'currency' },
+  { id: 'status', key: 'status' },
+  { id: 'statusDetail', key: 'statusDetail' },
+  { id: 'offersCount', key: 'offersCount' },
+  { id: 'offersComplete', key: 'offersComplete' },
+  { id: 'scrapedAt', key: 'scrapedAt' },
+]) {
+  COLUMN_FIELD[f.key] = f.id;
+}
+
+/**
+ * Resolve the active column set for a given selection. When `selected` is null
+ * or empty, every column is kept (backward compat).
+ */
+export function activeColumns(selected: string[] | null | undefined, maxOtherSellers?: number | null): Column[] {
+  if (!selected || selected.length === 0) selected = null;
+  const set = selected ? new Set(selected) : null;
+  const wantOther = set === null || set.has('otherSellers');
+  const cap = (maxOtherSellers === null || maxOtherSellers === undefined) ? Infinity : Math.max(0, maxOtherSellers);
+
+  return EXPORT_COLUMNS.filter((c) => {
+    const key = c.key as string;
+    if (key.startsWith('otherSeller')) {
+      if (!wantOther) return false;
+      const m = /^otherSeller(\d+)(Name|Price)$/.exec(key);
+      if (m) {
+        const n = Number(m[1]);
+        return n <= cap;
+      }
+      return true;
+    }
+    const fieldId = COLUMN_FIELD[key];
+    if (!fieldId) return true; // unknown columns are kept
+    if (set === null) return true;
+    return set.has(fieldId);
+  });
+}
+
 /**
  * Neutralise spreadsheet formula injection.
  *
@@ -406,6 +496,7 @@ export function rowsForProduct(product: ProductWithOffers, maxOtherSellers?: num
     currencyStatus: resolveCurrency(product.marketplaceId, product.currency, marketplace).status,
     offersCount: product.offers.length,
     offersComplete: product.offersComplete,
+    selectedFields: product.selectedFields ?? null,
     scrapedAt: product.scrapedAt,
     detectionMethod: product.provenance?.detectionMethod ?? 'single-marketplace',
     detectionStatus: product.provenance?.detectionStatus ?? 'PROVIDED',
@@ -700,10 +791,18 @@ export function failedRow(
 }
 
 /** Serialise rows to tab-separated text. */
-export function toTsv(rows: Iterable<ExportRow>): string {
-  const header = EXPORT_COLUMNS.map((column) => column.header).join('\t');
+export function toTsv(
+  rows: Iterable<ExportRow>,
+  selectedFields?: string[] | null,
+  maxOtherSellers?: number | null,
+): string {
+  const rowArray = Array.from(rows);
+  const selected = selectedFields ?? rowArray[0]?.selectedFields ?? null;
+  const maxOther = maxOtherSellers ?? (typeof rowArray[0]?.maxOtherSellers === 'number' ? rowArray[0].maxOtherSellers : null);
+  const columns = activeColumns(selected, maxOther);
+  const header = columns.map((column) => column.header).join('\t');
   const body: string[] = [];
-  for (const row of rows) body.push(tsvLine(row));
+  for (const row of rowArray) body.push(tsvLineForColumns(row, columns));
   return [header, ...body].join('\n');
 }
 
@@ -716,14 +815,20 @@ export function toTsv(rows: Iterable<ExportRow>): string {
 export function writeTsvStream(
   rows: Iterable<ExportRow>,
   write: (chunk: string) => void,
+  selectedFields?: string[] | null,
+  maxOtherSellers?: number | null,
 ): number {
-  write(`${EXPORT_COLUMNS.map((column) => column.header).join('\t')}\n`);
+  const rowArray = Array.from(rows);
+  const selected = selectedFields ?? rowArray[0]?.selectedFields ?? null;
+  const maxOther = maxOtherSellers ?? (typeof rowArray[0]?.maxOtherSellers === 'number' ? rowArray[0].maxOtherSellers : null);
+  const columns = activeColumns(selected, maxOther);
+  write(`${columns.map((column) => column.header).join('\t')}\n`);
   let count = 0;
   // Flush in batches so a 10k-ASIN export does not issue tens of thousands of
   // tiny writes.
   let buffer: string[] = [];
-  for (const row of rows) {
-    buffer.push(`${tsvLine(row)}\n`);
+  for (const row of rowArray) {
+    buffer.push(`${tsvLineForColumns(row, columns)}\n`);
     count += 1;
     if (buffer.length >= 500) {
       write(buffer.join(''));
@@ -734,9 +839,9 @@ export function writeTsvStream(
   return count;
 }
 
-/** Format one row as a tab-separated line. */
-function tsvLine(row: ExportRow): string {
-  return EXPORT_COLUMNS.map((column) => {
+/** Format one row as a tab-separated line, using the given column set. */
+function tsvLineForColumns(row: ExportRow, columns: Column[]): string {
+  return columns.map((column) => {
     const value = row[column.key as keyof ExportRow];
     if (value === null || value === undefined) return '';
     if (typeof value === 'boolean') return value ? 'YES' : 'NO';
@@ -750,17 +855,26 @@ function tsvLine(row: ExportRow): string {
  * Accepts any iterable of rows, so a large batch can be streamed in rather
  * than materialised. Row count is tracked for the worksheet's autofilter range.
  */
-export async function toWorkbook(rows: Iterable<ExportRow>): Promise<Buffer> {
+export async function toWorkbook(
+  rows: Iterable<ExportRow>,
+  selectedFields?: string[] | null,
+  maxOtherSellers?: number | null,
+): Promise<Buffer> {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'Scraper Tool';
   workbook.created = new Date();
+
+  const rowArray = Array.from(rows);
+  const selected = selectedFields ?? rowArray[0]?.selectedFields ?? null;
+  const maxOther = maxOtherSellers ?? (typeof rowArray[0]?.maxOtherSellers === 'number' ? rowArray[0].maxOtherSellers : null);
+  const columns = activeColumns(selected, maxOther);
 
   // One worksheet for everything, as required — never one sheet per product.
   const sheet = workbook.addWorksheet('All Seller Results', {
     views: [{ state: 'frozen', ySplit: 1 }],
   });
 
-  sheet.columns = EXPORT_COLUMNS.map((column) => ({
+  sheet.columns = columns.map((column) => ({
     header: column.header,
     key: String(column.key),
     width: column.width,
@@ -773,31 +887,73 @@ export async function toWorkbook(rows: Iterable<ExportRow>): Promise<Buffer> {
   headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
   headerRow.height = 22;
 
+  // Reuse the already-materialised rows (the iterable may be a generator and
+  // can only be consumed once).
+  const allRows = rowArray;
+  // Only truly failed / unverified rows go to the Failed tab. INCOMPLETE and
+  // NO_OFFERS rows still carry useful data and stay in the main results sheet.
+  const failedRows = allRows.filter((r) => r.status === 'FAILED' || r.status === 'NOT_FOUND');
+  const okRows = allRows.filter((r) => r.status !== 'FAILED' && r.status !== 'NOT_FOUND');
+
+  // ---- Sheet 1: successful seller results ----
   let rowCount = 0;
-  for (const row of rows) {
+  for (const row of okRows) {
     rowCount += 1;
     sheet.addRow(
       Object.fromEntries(
-        EXPORT_COLUMNS.map((column) => {
+        columns.map((column) => {
           const value = (row as unknown as Record<string, unknown>)[column.key as string];
-          // Numbers go in as native numeric cells so Excel can sort and sum.
           if (typeof value === 'number') return [String(column.key), value];
-          // Booleans are rendered as YES/NO in BOTH formats so the XLSX and the
-          // TSV carry identical values.
           if (typeof value === 'boolean') return [String(column.key), value ? 'YES' : 'NO'];
           if (value === null || value === undefined) return [String(column.key), ''];
-          // Text is flattened for alignment and then formula-sanitised.
           return [String(column.key), safeCell(flatten(String(value)))];
         }),
       ),
     );
   }
 
+  // ---- Sheet 2: failed / incomplete / no-offer rows (same columns) ----
+  if (failedRows.length > 0) {
+    const failedSheet = workbook.addWorksheet('Failed', {
+      views: [{ state: 'frozen', ySplit: 1 }],
+    });
+    failedSheet.columns = columns.map((column) => ({
+      header: column.header,
+      key: String(column.key),
+      width: column.width,
+    }));
+    const failedHeader = failedSheet.getRow(1);
+    failedHeader.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    failedHeader.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC00000' } };
+    failedHeader.alignment = { vertical: 'middle', horizontal: 'center' };
+    failedHeader.height = 22;
+
+    for (const row of failedRows) {
+      failedSheet.addRow(
+        Object.fromEntries(
+          columns.map((column) => {
+            const value = (row as unknown as Record<string, unknown>)[column.key as string];
+            if (typeof value === 'number') return [String(column.key), value];
+            if (typeof value === 'boolean') return [String(column.key), value ? 'YES' : 'NO'];
+            if (value === null || value === undefined) return [String(column.key), ''];
+            return [String(column.key), safeCell(flatten(String(value)))];
+          }),
+        ),
+      );
+    }
+    if (failedRows.length > 0) {
+      failedSheet.autoFilter = {
+        from: { row: 1, column: 1 },
+        to: { row: failedRows.length + 1, column: columns.length },
+      };
+    }
+  }
+
   // Best-effort embedded thumbnails. Downloaded with a short timeout and a
   // small concurrency cap; a broken or unreachable URL simply leaves the
   // "Product Image" cell blank — the URL column still carries the link.
-  const imageColumnIndex = EXPORT_COLUMNS.findIndex((column) => column.key === 'productImage');
-  const imageUrlColumnIndex = EXPORT_COLUMNS.findIndex((column) => column.key === 'productImageUrl');
+  const imageColumnIndex = columns.findIndex((column) => column.key === 'productImage');
+  const imageUrlColumnIndex = columns.findIndex((column) => column.key === 'productImageUrl');
   if (imageColumnIndex >= 0 && imageUrlColumnIndex >= 0 && rowCount > 0) {
     const imageCol = imageColumnIndex + 1; // 1-based for ExcelJS
     const urlCol = imageUrlColumnIndex + 1;
@@ -841,12 +997,12 @@ export async function toWorkbook(rows: Iterable<ExportRow>): Promise<Buffer> {
   if (rowCount > 0) {
     sheet.autoFilter = {
       from: { row: 1, column: 1 },
-      to: { row: rowCount + 1, column: EXPORT_COLUMNS.length },
+      to: { row: rowCount + 1, column: columns.length },
     };
   }
 
   // Numeric formatting for money, rating and day columns.
-  for (const column of EXPORT_COLUMNS) {
+  for (const column of columns) {
     if (!column.numeric) continue;
     sheet.getColumn(String(column.key)).numFmt = '#,##0.00';
   }

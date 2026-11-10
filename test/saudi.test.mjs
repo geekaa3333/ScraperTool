@@ -33,7 +33,7 @@ const ASIN = 'B0C0NNECT1';
 
 test('Saudi Arabia is one of the supported marketplaces', () => {
   assert.ok(MARKETPLACE_IDS.includes('sa'));
-  assert.equal(MARKETPLACE_IDS.length, 6);
+  assert.equal(MARKETPLACE_IDS.length, 7);
 });
 
 test('the canonical Saudi product URL is generated correctly', () => {

@@ -25,7 +25,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-/** The six marketplaces and the currency each one must report. */
+/** The seven marketplaces and the currency each one must report. */
 const EXPECTED = {
   eg: 'EGP',
   ae: 'AED',
@@ -33,13 +33,14 @@ const EXPECTED = {
   uk: 'GBP',
   ca: 'CAD',
   us: 'USD',
+  de: 'EUR',
 };
 
 // ---------------------------------------------------------------------------
 // Every marketplace resolves its own currency
 // ---------------------------------------------------------------------------
 
-test('all six marketplaces report their own currency', () => {
+test('all seven marketplaces report their own currency', () => {
   assert.deepEqual([...MARKETPLACE_IDS].sort(), Object.keys(EXPECTED).sort());
 
   for (const [id, expected] of Object.entries(EXPECTED)) {
@@ -239,7 +240,7 @@ test('a mixed multi-marketplace export never applies one currency to every row',
 
   // The decisive check: the report is genuinely mixed, and the CSV says so.
   const distinct = new Set(rows.map((r) => r.currency));
-  assert.equal(distinct.size, 6, 'all six currencies are present');
+  assert.equal(distinct.size, 7, 'all seven currencies are present');
   assert.equal(isSingleCurrency([...distinct]), false);
 
   const tsv = toTsv(rows);
@@ -284,7 +285,7 @@ test('the workbook writes a numeric currency column per row', async () => {
     const value = ws.getRow(i).getCell(currencyCol).value;
     if (value) seen.add(String(value));
   }
-  assert.equal(seen.size, 6, 'every row carries its own currency in the workbook');
+  assert.equal(seen.size, 7, 'every row carries its own currency in the workbook');
 });
 
 // ---------------------------------------------------------------------------

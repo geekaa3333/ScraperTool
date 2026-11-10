@@ -152,6 +152,24 @@
       <!-- ════ new Bulk ASIN Scraper tab ════ -->
       <div id="tab-bulk" class="hidden">
 
+        <!-- ── field selection (collapsible) ────────────────────── -->
+        <section class="panel" id="fieldSelectionPanel">
+          <details id="fieldSelectionDetails">
+            <summary>
+              <h2 style="display:inline;">Select Data to Scrape (Optional)</h2>
+              <span class="hint" id="fieldCount" style="margin-left:.75rem;">0 fields selected</span>
+            </summary>
+            <div class="field-presets" style="margin:.75rem 0;">
+              <button class="ghost small" data-preset="basic">Basic Product Data</button>
+              <button class="ghost small" data-preset="buybox">Buy Box Data</button>
+              <button class="ghost small" data-preset="full">Full Scraping</button>
+              <button class="ghost small" id="selectAllFields">Select All</button>
+              <button class="ghost small" id="clearAllFields">Clear All</button>
+            </div>
+            <div id="fieldChecklist" class="field-checklist"></div>
+          </details>
+        </section>
+
         <!-- step 1: upload -->
         <section class="panel">
           <h2>1 · Choose a mode &amp; upload</h2>

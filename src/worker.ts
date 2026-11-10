@@ -334,6 +334,8 @@ export interface ScrapeOptions {
   sourceRow?: number | null;
   /** Uploaded file this ASIN was read from, when part of a batch. */
   sourceFile?: string | null;
+  /** Requested field ids. When omitted, all fields are scraped (backward compat). */
+  selectedFields?: string[];
 }
 
 export class ScrapeWorker {
@@ -692,11 +694,14 @@ export class ScrapeWorker {
       const product = parseProductDetail(productHtml, asin, marketplace);
       recordTiming('product-parse', Number(process.hrtime.bigint() - parseStarted) / 1e6);
 
+      const selected = options.selectedFields && options.selectedFields.length > 0 ? new Set(options.selectedFields) : null;
+      const want = (id: string) => selected === null || selected.has(id);
+      const wantTitleEn = want('titleEn');
+      const wantBuyBox = want('buyBoxSellerName') || want('buyBoxSellerPrice') || want('buyBoxSellerId') || want('isBuyBox') || want('buyBoxShipping') || want('buyBoxTotal') || want('buyBoxRating') || want('buyBoxFeedback') || want('buyBoxFulfillment') || want('buyBoxCondition') || want('buyBoxStock');
+      const wantOffers = want('otherSellers') || want('buyBoxSellerName') || want('buyBoxSellerPrice');
+
       // --- English title (best-effort) ---
-      // Amazon serves arabic.eg in Arabic; an English title lets the user
-      // search the export sheet in English. Fetched from a supported API
-      // provider so it works even when direct scraping is blocked.
-      if (!product.titleEn && process.env.SERPAPI_API_KEY) {
+      if (wantTitleEn && !product.titleEn && process.env.SERPAPI_API_KEY) {
         try {
           const url = new URL('https://serpapi.com/search');
           url.searchParams.set('engine', 'amazon_product');
@@ -719,7 +724,7 @@ export class ScrapeWorker {
       let buyBoxSellerId: string | null = null;
       let buyBoxSellerName: string | null = null;
       let buyBoxDeliveryText: string | null = null;
-      try {
+      if (wantBuyBox) try {
         const $ = cheerio.load(productHtml);
 
         // Selectors are tried individually and the first *non-empty* one wins.
@@ -777,18 +782,31 @@ export class ScrapeWorker {
       // --- offers ---
       // Same context, so it inherits the destination and currency preference the
       // product page established. Every seller offer is priced accordingly.
-      const offersHtml = await this.fetchHtml(page, offersPage, OFFERS_READY_SELECTOR);
-      const offersParseStarted = process.hrtime.bigint();
-      const parsed = parseOffers(offersHtml, {
-        asin,
-        domain: marketplace.domain,
-        marketplaceId: marketplace.id,
-        now,
-        destination,
-        buyBoxSellerId,
-        buyBoxSellerName,
-      });
-      recordTiming('offers-parse', Number(process.hrtime.bigint() - offersParseStarted) / 1e6);
+      // Skip the entire offers page load when no seller/offer fields were
+      // requested — it is the most expensive operation we can avoid.
+      let parsed: ReturnType<typeof parseOffers>;
+      if (wantOffers) {
+        const offersHtml = await this.fetchHtml(page, offersPage, OFFERS_READY_SELECTOR);
+        const offersParseStarted = process.hrtime.bigint();
+        parsed = parseOffers(offersHtml, {
+          asin,
+          domain: marketplace.domain,
+          marketplaceId: marketplace.id,
+          now,
+          destination,
+          buyBoxSellerId,
+          buyBoxSellerName,
+        });
+        recordTiming('offers-parse', Number(process.hrtime.bigint() - offersParseStarted) / 1e6);
+      } else {
+        parsed = {
+          offers: [],
+          complete: true,
+          completenessNote: null,
+          totalCount: null,
+          pagesFetched: 0,
+        };
+      }
 
       // --- hidden buying options ---
       // Amazon withholds the seller list behind "See all buying options". Not
@@ -796,7 +814,7 @@ export class ScrapeWorker {
       // choice to hide them rather than about the number of sellers.
       let buyingOptionsOpened = false;
       let buyingOptionsAttempted = false;
-      if (parsed.offers.length === 0 || !parsed.complete) {
+      if (wantOffers && (parsed.offers.length === 0 || !parsed.complete)) {
         buyingOptionsAttempted = true;
         buyingOptionsOpened = await this.withBuyingOptionBudget(async () => {
           try {
@@ -942,6 +960,7 @@ export class ScrapeWorker {
         offersTotalCount: parsed.totalCount,
         offersPagesFetched: parsed.pagesFetched,
         scrapedAt: now.toISOString(),
+        selectedFields: options.selectedFields ?? null,
         localisationNote: localisation.note,
         destination,
         buyBoxDeliveryText,

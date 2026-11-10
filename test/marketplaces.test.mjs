@@ -22,14 +22,15 @@ import {
 // Configuration
 // ---------------------------------------------------------------------------
 
-test('exactly the six required marketplaces are configured', () => {
-  assert.deepEqual(MARKETPLACE_IDS, ['eg', 'ae', 'sa', 'uk', 'ca', 'us']);
+test('exactly the seven required marketplaces are configured', () => {
+  assert.deepEqual(MARKETPLACE_IDS, ['eg', 'ae', 'sa', 'uk', 'ca', 'us', 'de']);
   assert.equal(MARKETPLACES.eg.domain, 'amazon.eg');
   assert.equal(MARKETPLACES.ae.domain, 'amazon.ae');
   assert.equal(MARKETPLACES.sa.domain, 'amazon.sa');
   assert.equal(MARKETPLACES.uk.domain, 'amazon.co.uk');
   assert.equal(MARKETPLACES.ca.domain, 'amazon.ca');
   assert.equal(MARKETPLACES.us.domain, 'amazon.com');
+  assert.equal(MARKETPLACES.de.domain, 'amazon.de');
 });
 
 test('Amazon Saudi Arabia is configured as specified', () => {
@@ -60,13 +61,14 @@ test('each marketplace carries the right currency and country', () => {
       ['GBP', 'GB'],
       ['CAD', 'CA'],
       ['USD', 'US'],
+      ['EUR', 'DE'],
     ],
   );
 });
 
 test('each marketplace has a distinct cache namespace', () => {
   const namespaces = MARKETPLACE_IDS.map((id) => MARKETPLACES[id].cacheNamespace);
-  assert.equal(new Set(namespaces).size, 6, 'namespaces must not collide');
+  assert.equal(new Set(namespaces).size, 7, 'namespaces must not collide');
 });
 
 test('default marketplace is Egypt', () => {
@@ -126,7 +128,8 @@ test('marketplaceFromUrl rejects unsupported and spoofed hosts', () => {
     'https://evil.test/?x=amazon.com',
     'https://amazon.sa.evil.test/dp/B01',
     'https://notamazon.sa/dp/B01',
-    'https://amazon.de/dp/B01',
+    'https://amazon.de.evil.test/dp/B01',
+    'https://notamazon.de/dp/B01',
     'https://amazon.fr/dp/B01',
     'not a url at all',
   ];
@@ -136,13 +139,14 @@ test('marketplaceFromUrl rejects unsupported and spoofed hosts', () => {
   }
 });
 
-test('isSupportedAmazonUrl accepts exactly the five marketplaces', () => {
+test('isSupportedAmazonUrl accepts exactly the seven marketplaces', () => {
   assert.equal(isSupportedAmazonUrl('https://www.amazon.eg/dp/B01'), true);
   assert.equal(isSupportedAmazonUrl('https://amazon.ae/dp/B01'), true);
   assert.equal(isSupportedAmazonUrl('https://www.amazon.sa/dp/B01'), true);
   assert.equal(isSupportedAmazonUrl('https://www.amazon.co.uk/dp/B01'), true);
   assert.equal(isSupportedAmazonUrl('https://amazon.ca/dp/B01'), true);
   assert.equal(isSupportedAmazonUrl('https://amazon.com/dp/B01'), true);
+  assert.equal(isSupportedAmazonUrl('https://www.amazon.de/dp/B01'), true);
 });
 
 // ---------------------------------------------------------------------------
@@ -188,11 +192,12 @@ test('resolveMarketplace accepts full product URLs', () => {
 });
 
 test('resolveMarketplace returns null for unknown input rather than guessing', () => {
-  assert.equal(resolveMarketplace('Germany'), null);
-  assert.equal(resolveMarketplace('amazon.de'), null);
+  assert.equal(resolveMarketplace('Germany'), 'de');
+  assert.equal(resolveMarketplace('amazon.de'), 'de');
   assert.equal(resolveMarketplace(''), null);
   assert.equal(resolveMarketplace(null), null);
   assert.equal(resolveMarketplace('B09LH36816'), null, 'an ASIN is not a marketplace');
+  assert.equal(resolveMarketplace('Atlantis'), null, 'unknown country is not a marketplace');
 });
 
 test('resolveMarketplace never infers a marketplace from an ASIN', () => {
@@ -215,15 +220,15 @@ test('resolveWithProvenance records how a marketplace was determined', () => {
   assert.equal(fromColumn.method, 'column');
   assert.equal(fromColumn.originalInput, 'Canada');
 
-  const unknown = resolveWithProvenance('Germany');
+  const unknown = resolveWithProvenance('Atlantis');
   assert.equal(unknown.marketplaceId, null);
   assert.equal(unknown.method, 'unknown');
   assert.equal(unknown.status, 'UNKNOWN');
 });
 
-test('isMarketplaceId only accepts the five known ids', () => {
+test('isMarketplaceId only accepts the seven known ids', () => {
   for (const id of MARKETPLACE_IDS) assert.equal(isMarketplaceId(id), true);
-  assert.equal(isMarketplaceId('de'), false);
+  assert.equal(isMarketplaceId('de'), true);
   assert.equal(isMarketplaceId('EG'), false, 'ids are lowercase');
   assert.equal(isMarketplaceId(null), false);
   assert.equal(isMarketplaceId(42), false);

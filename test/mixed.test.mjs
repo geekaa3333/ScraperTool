@@ -144,15 +144,24 @@ test('mode B keeps the original region text for traceability', () => {
   assert.equal(result.rows[1].originalInput, 'amazon.co.uk');
 });
 
-test('an unrecognised region marks the row as unknown rather than defaulting', () => {
+test('a written region name maps to its marketplace', () => {
   const cells = [['B000000001', 'Germany']];
+  const columns = cols(0, 1, null);
+
+  const result = parseWorkbookRows(cells, columns, 'region-column', null);
+
+  assert.equal(result.rows[0].marketplaceId, 'de');
+});
+
+test('an unrecognised region marks the row as unknown rather than defaulting', () => {
+  const cells = [['B000000001', 'Atlantis']];
   const columns = cols(0, 1, null);
 
   const result = parseWorkbookRows(cells, columns, 'region-column', null);
 
   assert.equal(result.rows[0].marketplaceId, null, 'must not silently become Egypt');
   assert.equal(result.rows[0].detectionStatus, 'NOT_CHECKED');
-  assert.equal(result.rows[0].originalInput, 'Germany');
+  assert.equal(result.rows[0].originalInput, 'Atlantis');
 });
 
 // ---------------------------------------------------------------------------
@@ -302,7 +311,7 @@ test('parseProductInput rejects unsupported and unsafe hosts', () => {
   assert.equal(hostile.marketplaceId, null);
   assert.match(hostile.error ?? '', /not one of the supported Amazon/i);
 
-  assert.match(parseProductInput('https://amazon.de/dp/B0CX23V2ZK').error ?? '', /supported/i);
+  assert.match(parseProductInput('https://amazon.fr/dp/B0CX23V2ZK').error ?? '', /supported/i);
 });
 
 test('parseProductInput rejects junk', () => {

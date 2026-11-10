@@ -81,6 +81,9 @@ async function init() {
   // Real database counts, never estimates.
   await loadDashboard();
 
+  // Custom scraping field selection (optional).
+  await initFieldSelection();
+
   // Marketplace catalogue drives every selector in the UI.
   try {
     const payload = await (await fetch('/api/marketplaces')).json();
@@ -233,6 +236,8 @@ async function analyse() {
   try {
     const params = new URLSearchParams({ asin: input, marketplace });
     if (state.destination?.id) params.set('destination', state.destination.id);
+    const sf = (typeof getSelectedFields === 'function') ? getSelectedFields() : null;
+    if (sf && sf.length > 0) params.set('fields', sf.join(','));
 
     const response = await fetch(`/api/product?${params}`);
     const body = await response.json();
@@ -1214,6 +1219,10 @@ async function uploadWorkbook(forceColumns = false) {
     if ($b('bulkUrlColumn').value !== '') params.set('urlColumn', $b('bulkUrlColumn').value);
   }
 
+  // Custom scraping fields selection.
+  const sf = (typeof getSelectedFields === 'function') ? getSelectedFields() : null;
+  if (sf && sf.length > 0) params.set('fields', sf.join(','));
+
   clearBanner();
   busy($b('bulkUpload'), true, 'Reading…');
 
@@ -1707,7 +1716,10 @@ function renderBulkResults() {
 function downloadExport(format) {
   if (!bulk.jobId) return;
   const ext = format === 'tsv' ? 'txt' : 'xlsx';
-  window.location.href = `/api/bulk/jobs/${bulk.jobId}/export.${format}`;
+  const sf = (typeof getSelectedFields === 'function') ? getSelectedFields() : null;
+  const url = new URL(`/api/bulk/jobs/${bulk.jobId}/export.${format}`, window.location.origin);
+  if (sf && sf.length > 0) url.searchParams.set('fields', sf.join(','));
+  window.location.href = url.toString();
   void ext;
 }
 
@@ -1731,3 +1743,195 @@ async function copyAllResults() {
     busy(button, false);
   }
 }
+
+// ── custom scraping field selection ────────────────────────────────────────
+
+const FIELD_STORAGE_KEY = 'scraper.selectedFields';
+let fieldDefs = [];
+let selectedFields = new Set();
+
+async function initFieldSelection() {
+  try {
+    const payload = await (await fetch('/api/fields')).json();
+    fieldDefs = payload.fields ?? [];
+    const presets = payload.presets ?? {};
+    const defaults = payload.default ?? fieldDefs.map((f) => f.id);
+
+    // Load saved selection from localStorage
+    try {
+      const saved = localStorage.getItem(FIELD_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          selectedFields = new Set(parsed);
+        } else {
+          selectedFields = new Set(defaults);
+        }
+      } else {
+        selectedFields = new Set(defaults);
+      }
+    } catch {
+      selectedFields = new Set(defaults);
+    }
+
+    renderFieldChecklist();
+    updateFieldCount();
+
+    // Preset buttons
+    document.querySelectorAll('[data-preset]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const preset = btn.dataset.preset;
+        if (preset === 'basic') selectedFields = new Set(presets.basic ?? []);
+        else if (preset === 'buybox') selectedFields = new Set(presets.buybox ?? []);
+        else if (preset === 'full') selectedFields = new Set(presets.full ?? defaults);
+        saveFieldSelection();
+        renderFieldChecklist();
+        updateFieldCount();
+      });
+    });
+
+    $('selectAllFields')?.addEventListener('click', () => {
+      selectedFields = new Set(fieldDefs.map((f) => f.id));
+      saveFieldSelection();
+      renderFieldChecklist();
+      updateFieldCount();
+    });
+
+    $('clearAllFields')?.addEventListener('click', () => {
+      selectedFields = new Set();
+      saveFieldSelection();
+      renderFieldChecklist();
+      updateFieldCount();
+    });
+
+    $('fieldSelectionDetails')?.addEventListener('toggle', () => {
+      if ($('fieldSelectionDetails').open) {
+        renderFieldChecklist();
+      }
+    });
+  } catch (error) {
+    console.error('Failed to load field definitions:', error);
+  }
+}
+
+function renderFieldChecklist() {
+  const container = $('fieldChecklist');
+  if (!container) return;
+
+  // Group fields
+  const groups = {};
+  for (const f of fieldDefs) {
+    if (!groups[f.group]) groups[f.group] = [];
+    groups[f.group].push(f);
+  }
+
+  let html = '';
+  for (const [group, fields] of Object.entries(groups)) {
+    html += `<div class="field-group">${escapeHtml(group)}</div>`;
+    for (const f of fields) {
+      const checked = selectedFields.has(f.id) ? 'checked' : '';
+      html += `<label><input type="checkbox" data-field="${escapeHtml(f.id)}" ${checked} /> ${escapeHtml(f.label)}</label>`;
+      // For "Other Sellers", add individual OS 1..N checkboxes + All
+      if (f.id === 'otherSellers') {
+        const maxVal = parseInt(localStorage.getItem('scraper.maxOtherSellers') || '0', 10) || 0;
+        const allChecked = maxVal === 0 && selectedFields.has('otherSellers');
+        let osHtml = `<div style="grid-column:1/-1; margin-left:1.5rem; margin-bottom:.5rem; font-size:.8rem; color:#555;">
+          <div style="margin-bottom:.3rem;">Other Sellers columns to include:</div>
+          <label style="display:inline-flex; align-items:center; gap:.3rem; margin-right:.6rem;">
+            <input type="checkbox" data-os="all" ${allChecked ? 'checked' : ''} /> All
+          </label>`;
+        for (let n = 1; n <= 10; n++) {
+          const checkedN = (maxVal === 0 && selectedFields.has('otherSellers')) || maxVal >= n;
+          osHtml += `<label style="display:inline-flex; align-items:center; gap:.3rem; margin-right:.6rem;">
+            <input type="checkbox" data-os="${n}" ${checkedN ? 'checked' : ''} /> OS ${n}
+          </label>`;
+        }
+        osHtml += `<span class="hint" style="margin-left:.5rem;">(OS = Other Seller column; "All" = every seller)</span></div>`;
+        html += osHtml;
+      }
+    }
+  }
+  container.innerHTML = html;
+
+  container.querySelectorAll('input[data-field]').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      if (cb.checked) selectedFields.add(cb.dataset.field);
+      else selectedFields.delete(cb.dataset.field);
+      if (selectedFields.size === 0) {
+        selectedFields.add(fieldDefs[0]?.id);
+        cb.checked = true;
+      }
+      saveFieldSelection();
+      updateFieldCount();
+    });
+  });
+
+  // Other Sellers column selector: OS 1..N or All
+  // Other Sellers column selector: OS 1..N or All
+  container.querySelectorAll('input[data-os]').forEach(function (cb) {
+    cb.addEventListener('change', function () {
+      const osCheckboxes = Array.from(container.querySelectorAll('input[data-os]'));
+      const allCb = osCheckboxes.find(function (c) { return c.dataset.os === 'all'; });
+      const nCbs = osCheckboxes.filter(function (c) { return c.dataset.os !== 'all'; });
+
+      if (cb.dataset.os === 'all') {
+        if (cb.checked) {
+          nCbs.forEach(function (c) { c.checked = true; });
+          try { localStorage.setItem('scraper.maxOtherSellers', '0'); } catch (e) {}
+        } else {
+          nCbs.forEach(function (c) { c.checked = false; });
+          try { localStorage.setItem('scraper.maxOtherSellers', '0'); } catch (e) {}
+        }
+      } else {
+        const checkedNs = nCbs.filter(function (c) { return c.checked; }).map(function (c) { return parseInt(c.dataset.os, 10); });
+        const maxN = checkedNs.length > 0 ? Math.max.apply(null, checkedNs) : 0;
+        const allChecked = nCbs.every(function (c) { return c.checked; });
+        if (allChecked && allCb) allCb.checked = true;
+        else if (allCb) allCb.checked = false;
+        if (checkedNs.length > 0) {
+          selectedFields.add('otherSellers');
+          const osCheckbox = container.querySelector('input[data-field="otherSellers"]');
+          if (osCheckbox) osCheckbox.checked = true;
+        } else {
+          const osCheckbox = container.querySelector('input[data-field="otherSellers"]');
+          if (osCheckbox && !osCheckbox.checked) selectedFields.delete('otherSellers');
+        }
+        try { localStorage.setItem('scraper.maxOtherSellers', allChecked ? '0' : String(maxN)); } catch (e) {}
+      }
+      saveFieldSelection();
+      updateFieldCount();
+    });
+  });
+
+}
+
+function updateFieldCount() {
+  const el = $('fieldCount');
+  if (el) el.textContent = `${selectedFields.size} field${selectedFields.size === 1 ? '' : 's'} selected`;
+}
+
+function saveFieldSelection() {
+  try {
+    localStorage.setItem(FIELD_STORAGE_KEY, JSON.stringify([...selectedFields]));
+  } catch {}
+}
+
+function getMaxOtherSellers() {
+  const el = document.getElementById('maxOtherSellers');
+  if (!el) return 0;
+  const v = parseInt(el.value, 10);
+  const n = Number.isFinite(v) && v >= 0 ? v : 0;
+  try { localStorage.setItem('scraper.maxOtherSellers', String(n)); } catch {}
+  return n;
+}
+
+function getSelectedFields() {
+  if (selectedFields.size === 0) return null;
+  return [...selectedFields];
+}
+
+// Patch bulk upload to include selected fields
+const _origBulkUpload = window._bulkUpload;
+// We'll hook into the upload fetch by overriding the URL construction in app.js
+// Instead, expose a getter used by the bulk upload code.
+window.getSelectedFields = getSelectedFields;

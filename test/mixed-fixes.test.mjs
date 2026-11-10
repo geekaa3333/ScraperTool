@@ -807,7 +807,7 @@ test('detection counts come from indexed aggregates, not a full row load', () =>
   assert.match(plan, /idx_items_detection|SCAN bulk_items USING COVERING INDEX/);
   store.close();
 });
-test('resuming an interrupted batch finishes detection before scraping', async () => {
+test('resuming an interrupted batch finishes detection and scrapes immediately', async () => {
   const store = new Store(':memory:');
   store.createBulkJob({
     id: 'job-resume',
@@ -830,12 +830,10 @@ test('resuming an interrupted batch finishes detection before scraping', async (
     'CONFIRMED_FOUND',
     'the outstanding check is resolved on resume',
   );
-  // Detection ends by pausing, so the scrape only begins when the user asks.
-  assert.equal(store.getBulkJob('job-resume').status, 'paused');
-
-  runner.start('job-resume');
-  await new Promise((resolve) => setTimeout(resolve, 400));
-
-  assert.equal([...store.streamBulkResults('job-resume')].length, 1, 'then it is scraped');
+  // Interleaved detection + scraping: the confirmed item is scraped in the
+  // same pass — no waiting for a second Start like the old pause-and-resume
+  // detection flow.
+  assert.equal([...store.streamBulkResults('job-resume')].length, 1, 'the confirmed item is scraped');
+  assert.equal(store.getBulkJob('job-resume').status, 'completed');
   store.close();
 });

@@ -36,6 +36,18 @@ import {
   type BulkMode,
 } from './asins.js';
 import { toTsv, toWorkbook, writeTsvStream } from './exports.js';
+import { DEFAULT_FIELDS, FIELDS, PRESETS } from './fields.js';
+
+/** Parse a comma-separated `fields` query param into a validated field-id list. */
+function parseSelectedFields(raw: string | null): string[] | null {
+  if (!raw) return null;
+  const ids = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (ids.length === 0) return null;
+  // Validate against the registry; drop unknown ids silently.
+  const valid = new Set(DEFAULT_FIELDS);
+  const filtered = ids.filter((id) => valid.has(id));
+  return filtered.length > 0 ? filtered : null;
+}
 import { parseDirectFile, type DirectParseResult } from './direct.js';
 import { report as timingReport } from './timing.js';
 import {
@@ -358,6 +370,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  // ---- fields (custom scraping field selection) ----
+  if (path === '/api/fields') {
+    sendJson(res, 200, { fields: FIELDS, presets: PRESETS, default: DEFAULT_FIELDS });
+    return;
+  }
+
   // ---- recent ----
   if (path === '/api/recent') {
     sendJson(res, 200, { items: store.recent(25) });
@@ -435,6 +453,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
           detectionMethod: parsed.marketplaceId ? 'url' : requested ? 'single-marketplace' : 'default',
           detectionStatus: 'PROVIDED',
           originalInput: parsed.marketplaceId ? input.trim() : marketplaceId,
+          selectedFields: parseSelectedFields(url.searchParams.get('fields')) ?? undefined,
         },
       );
 
@@ -709,6 +728,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       mode,
       sourceName: file.filename,
       items,
+      selectedFields: parseSelectedFields(url.searchParams.get('fields')),
     });
 
     // Rows needing detection must not be processable until detection runs.
@@ -828,6 +848,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       mode,
       sourceName: 'pasted-text',
       items,
+      selectedFields: parseSelectedFields(url.searchParams.get('fields')),
     });
 
     if (parsed.needsDetection > 0) store.parkUnresolvedItems(jobId);
@@ -1005,6 +1026,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         .flatMap((entry) => entry.files.map((f) => f.filename))
         .join(', '),
       items,
+      selectedFields: parseSelectedFields(url.searchParams.get('fields')),
     });
 
     sendJson(res, 200, {
@@ -1068,9 +1090,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       return;
     }
 
-    // Detection runs in the background like the scrape loop, so the request
-    // returns immediately and progress is polled like any other phase.
-    const plannedChecks = bulk.startDetection(jobId, targets);
+    // Detection and scraping now run interleaved: as soon as a marketplace is
+    // confirmed for an ASIN, that ASIN is scraped immediately instead of
+    // waiting for the whole detection sweep to finish. `bulk.start()` handles
+    // both phases together.
+    const plannedChecks = asins.length * targets.length;
+    bulk.start(jobId);
     sendJson(res, 200, { started: true, plannedChecks, asins: asins.length, targets });
     return;
   }
@@ -1149,6 +1174,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     const [, jobId, format] = exportMatch;
     const stamp = new Date().toISOString().slice(0, 10);
     const rows = bulk.exportRows(jobId);
+    const selectedFields = parseSelectedFields(url.searchParams.get('fields'));
+    const maxOtherSellers = Number(url.searchParams.get('maxOtherSellers') ?? 0) || null;
 
     if (format === 'tsv') {
       // Streamed: a large batch is never assembled into one string.
@@ -1156,14 +1183,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         'content-type': 'text/tab-separated-values; charset=utf-8',
         'content-disposition': `attachment; filename="scraper-tool-${stamp}.txt"`,
       });
-      writeTsvStream(rows, (chunk) => res.write(chunk));
+      writeTsvStream(rows, (chunk) => res.write(chunk), selectedFields, maxOtherSellers);
       res.end();
       return;
     }
 
     // The generator is consumed inside the workbook builder, so rows are
     // released as they are written rather than collected first.
-    const buffer = await toWorkbook(rows);
+    const buffer = await toWorkbook(rows, selectedFields, maxOtherSellers);
     res.writeHead(200, {
       'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'content-disposition': `attachment; filename="scraper-tool-${stamp}.xlsx"`,

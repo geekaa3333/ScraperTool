@@ -84,8 +84,8 @@ export async function archiveJobReports(
     try {
       const bytes =
         format === 'tsv'
-          ? Buffer.from(toTsv(rows), 'utf8')
-          : await toWorkbook(rows);
+          ? Buffer.from(toTsv(rows, rows[0]?.selectedFields ?? null), 'utf8')
+          : await toWorkbook(rows, rows[0]?.selectedFields ?? null);
 
       const stored = await storage.put(
         reportKey({ userId: input.userId, reportId, filename }),

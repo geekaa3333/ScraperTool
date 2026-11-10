@@ -338,6 +338,8 @@ export interface SellerOffer {
 export interface ProductWithOffers extends ProductDetail {
   /** All offers visible to an anonymous shopper, best-effort. */
   offers: SellerOffer[];
+  /** Requested field ids for this scrape. When absent, all fields are kept. */
+  selectedFields?: string[] | null;
   /**
    * Whether we can prove the offer list is complete. `false` whenever Amazon
    * hid part of the list, paginated it, or we could not find a total count —
