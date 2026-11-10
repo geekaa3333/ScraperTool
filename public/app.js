@@ -1555,9 +1555,11 @@ async function pollProgress() {
     const eta = $b('bulkEta');
     if (progress.phase === 'detect') {
       // Stage 1 owns the request budget; saying so beats showing zeros that
-      // look like a stalled job.
+      // look like a stalled job. With interleaving, extraction does NOT wait
+      // for detection to finish — it starts per ASIN the moment its match is
+      // confirmed.
       eta.textContent =
-        'Detecting marketplaces — seller extraction starts once detection finishes.';
+        'Detecting marketplaces — seller extraction runs alongside it and starts on each confirmed ASIN.';
     } else if (e.currentAsin) {
       eta.textContent = `Currently scraping: ${e.currentAsin} on ${marketLabel(e.currentMarketplace)}`;
     } else if (e.totalConfirmed === 0) {
