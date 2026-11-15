@@ -127,6 +127,10 @@ export interface LocalisationResult {
   displayedDestination: string | null;
   /** Currency preference cookie that was set, if any. */
   preferenceCookie: string | null;
+  /** True when a page reload was needed. False means the page already served
+   * the localised content and was left untouched, so callers must re-read the
+   * HTML only when this is true. */
+  reloaded: boolean;
   /** What was attempted, for the diagnostic log. */
   note: string;
 }
@@ -564,6 +568,38 @@ export async function localisePage(
   const log = options.log ?? (() => undefined);
   const expected = marketplace.currency;
 
+  // Fast path for a REUSED context. When the page was navigated after the
+  // currency cookie and delivery destination were already set (the bulk runner
+  // reuses one context per marketplace), Amazon very often serves the correctly
+  // localised page on the first navigation. Reading the two controls before
+  // touching anything lets an already-correct page skip the destination modal,
+  // the cookie write and the reload entirely. Anything ambiguous — a currency
+  // that does not resolve, a destination header that cannot be read — falls
+  // through to the full flow below, so behaviour only changes when the page
+  // provably already matches the marketplace configuration.
+  {
+    const displayedNow = resolveCurrency(marketplace.id, await readDisplayedCurrency(page), marketplace).code;
+    const already = await readDisplayedDestination(page);
+    if (displayedNow === expected && already !== null && destinationAccepted(already, marketplace)) {
+      log(
+        `[localise] ${marketplace.id}: already serving ${expected} to "${already}" — skipping localisation round-trip`,
+      );
+      return {
+        ok: true,
+        displayedCurrency: displayedNow,
+        expectedCurrency: expected,
+        destinationApplied: true,
+        destinationStatus: 'APPLIED',
+        displayedDestination: already,
+        preferenceCookie: null,
+        reloaded: false,
+        note: `Already serving ${expected} as configured. Delivering to ${already}.`,
+      };
+    }
+  }
+
+  let reloaded = false;
+
   const preferenceCookie = await applyCurrencyPreference(context, marketplace);
   log(`[localise] ${marketplace.id}: currency preference ${preferenceCookie ?? '(unavailable)'}`);
 
@@ -582,6 +618,7 @@ export async function localisePage(
   // already on screen before them.
   if (destination.applied || preferenceCookie) {
     await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => undefined);
+    reloaded = true;
   }
 
   // The marker returned for a bare '$' is resolved through the marketplace
@@ -605,6 +642,7 @@ export async function localisePage(
     // destination is re-applied rather than assumed to have failed.
     await applyDeliveryDestination(page, marketplace, log);
     await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => undefined);
+    reloaded = true;
     displayed = await resolve();
   }
 
@@ -640,6 +678,7 @@ export async function localisePage(
     destinationStatus: destination.status,
     displayedDestination: destination.displayed,
     preferenceCookie,
+    reloaded,
     note: `${ok ? `Serving ${expected} as configured.` : `Amazon served ${displayed ?? 'no recognisable currency'} for ${marketplace.domain} after localisation. Reported as a mismatch rather than relabelled.`} ${destinationNote}`,
   };
 }

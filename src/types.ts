@@ -166,7 +166,7 @@ export interface ProductDetail extends Omit<SearchProduct, 'price'> {
    * `false` whenever exploration stopped at the configured bound, on an
    * unavailable variation, or when Amazon restricted access mid-exploration.
    */
-  variationsComplete?: boolean;
+  variationsComplete?: boolean | null;
   /**
    * Marketplace this product was scraped from. `amazon.eg` + ASIN and
    * `amazon.com` + the same ASIN are distinct records throughout the system.

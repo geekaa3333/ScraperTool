@@ -103,6 +103,10 @@ function makeRunner(store) {
     blockedForSeconds() {
       return this._blocked;
     },
+    async createReusableContext() {
+      // Stand-in for the long-lived per-marketplace browser context.
+      return { closed: false, async close() {} };
+    },
     async scrapeProduct(asin, destination, marketplace, options) {
       const result = product(asin, marketplace.id, 2);
       result.destination = destination;

@@ -225,7 +225,7 @@ export class AmazonCurrencyMismatchError extends AmazonScraperError {
 export class AccessRestrictedError extends AmazonScraperError {
   constructor(
     message: string,
-    readonly kind: 'captcha' | 'http-403' | 'http-429' | 'http-503' | 'layout-change',
+    readonly kind: 'captcha' | 'gate' | 'http-403' | 'http-429' | 'http-503' | 'layout-change',
     readonly status: number | null,
     hint: string,
   ) {
@@ -245,6 +245,33 @@ const BOT_CHECK_MARKERS = [
   // Amazon page, in English and in Arabic, so they tripped the breaker on
   // normal product pages. They are not evidence of a challenge.
 ];
+
+/**
+ * Amazon's "Continue shopping" interstitial.
+ *
+ * Not a CAPTCHA and not an absence: HTTP 200, ~4 KB, no image, nothing to
+ * type — only a GET form whose action is /errors_page/validateCaptcha and a
+ * submit button labelled "Continue shopping". Amazon serves it to slow a busy
+ * session; pressing the site's own button is the ordinary human path and
+ * normally returns the requested page. Nothing is solved, spoofed or rotated
+ * here — it is a click on the control the page itself offers.
+ */
+const GATE_PAGE_MARKERS = [
+  '/errors_page/validatecaptcha',
+  'click the button below to continue shopping',
+] as const;
+
+/** The gate's form and its submit control, for fast detection and pressing. */
+const GATE_FORM_SELECTOR = 'form[action*="validateCaptcha"]';
+const GATE_BUTTON_SELECTOR = `${GATE_FORM_SELECTOR} button, ${GATE_FORM_SELECTOR} input[type="submit"]`;
+/** Presses allowed before the session is declared genuinely throttled. */
+const GATE_PRESS_BUDGET = 2;
+/** Ready-wait after a press; a press responds in a second or two, not fifteen. */
+const GATE_RETRY_READY_MS = 12_000;
+
+function isGatePage(lowerHtml: string): boolean {
+  return GATE_PAGE_MARKERS.some((marker) => lowerHtml.includes(marker));
+}
 
 /**
  * Request pacing.
@@ -459,8 +486,10 @@ export class ScrapeWorker {
     });
 
     // The reload inside localisePage already fetched a localised page; take its
-    // HTML rather than paying for another navigation.
-    const html = localisation.destinationApplied || localisation.preferenceCookie
+    // HTML rather than paying for another navigation. When nothing was reloaded
+    // (the reused-context fast path), the first fetch already holds the
+    // localised page, so re-serialising it would only pay for a DOM read.
+    const html = localisation.reloaded
       ? (await this.fetchHtmlCurrent(page, readySelector)).html
       : first;
 
@@ -538,24 +567,99 @@ export class ScrapeWorker {
       }
 
       // Wait for the content this scrape actually needs, not a fixed delay.
-      // A missing selector is NOT treated as proof of absence: it falls through
-      // to the same HTML capture the old fixed sleep produced, so behaviour is
-      // unchanged when Amazon renders late.
-      if (readySelector) {
-        await page
-          .waitForSelector(readySelector, { state: 'attached', timeout: READY_TIMEOUT_MS })
-          .catch(() => undefined);
-      }
+      // The gate's form joins the wait, so a "Continue shopping" page resolves
+      // in well under a second instead of burning the whole product timeout on
+      // a title that will never render. A missing selector is NOT treated as
+      // proof of absence: it falls through to the same HTML capture the old
+      // fixed sleep produced, so behaviour is unchanged when Amazon renders late.
+      const waitSelector = readySelector
+        ? `${readySelector}, ${GATE_FORM_SELECTOR}`
+        : GATE_FORM_SELECTOR;
+      await page
+        .waitForSelector(waitSelector, { state: 'attached', timeout: READY_TIMEOUT_MS })
+        .catch(() => undefined);
 
       const contentStarted = process.hrtime.bigint();
-      const html = await page.content();
-      const lower = html.toLowerCase();
+      let html = await page.content();
+      let lower = html.toLowerCase();
+
+      // The "Continue shopping" gate misreads as "no product" if it reaches the
+      // parser, which used to permanently fail healthy ASINs at 15 s each.
+      // Press the site's own button instead — the human path — and re-capture.
+      if (isGatePage(lower)) {
+        for (let press = 1; press <= GATE_PRESS_BUDGET && isGatePage(lower); press++) {
+          console.log(`[gate] pressing Amazon's "Continue shopping" button (attempt ${press}/${GATE_PRESS_BUDGET})`);
+          try {
+            await page.locator(GATE_BUTTON_SELECTOR).first().click({ timeout: 5_000 });
+            await page
+              .waitForLoadState('domcontentloaded', { timeout: NAV_TIMEOUT_MS })
+              .catch(() => undefined);
+          } catch {
+            // A click racing with navigation is covered by the next press.
+          }
+          await page
+            .waitForSelector(waitSelector, { state: 'attached', timeout: GATE_RETRY_READY_MS })
+            .catch(() => undefined);
+          html = await page.content();
+          lower = html.toLowerCase();
+        }
+
+        if (!isGatePage(lower)) {
+          // amzn-r sometimes routes the press to the storefront instead of the
+          // requested page; one plain re-request fixes that without paying for
+          // another gate round-trip.
+          const present = readySelector
+            ? (await page.$(readySelector).catch(() => null)) !== null
+            : true;
+          if (!present && page.url() !== url) {
+            const again = await page
+              .goto(url, { waitUntil: 'commit', timeout: NAV_TIMEOUT_MS })
+              .catch(() => null);
+            if (again && again.status() === 200) {
+              await page
+                .waitForSelector(waitSelector, { state: 'attached', timeout: GATE_RETRY_READY_MS })
+                .catch(() => undefined);
+              html = await page.content();
+              lower = html.toLowerCase();
+            }
+          }
+        }
+
+        // Still gated after the presses: the session is genuinely throttled.
+        // Pausing honestly beats recording a wall of "product not found" rows.
+        if (isGatePage(lower)) {
+          this.tripBlock(`Amazon kept serving the "Continue shopping" gate for ${url}`);
+          throw new AccessRestrictedError(
+            'Amazon is serving a persistent "Continue shopping" gate instead of the page (access restricted).',
+            'gate',
+            status,
+            "Pressing the site's button twice did not clear it. Processing pauses; resume when the session cools down.",
+          );
+        }
+      }
       // Only treat these as a challenge when the page does not carry a product.
       // The footer of a perfectly healthy Amazon page contains the same words
       // (it is Amazon's standard API-access notice, in every language), so
       // matching them unconditionally tripped the breaker on normal pages —
       // which is exactly the "processing paused, Amazon served a bot challenge"
       // message that appeared every few products on amazon.eg.
+      // DEBUG CAPTURE: any page that reaches the classifier without a product
+      // title is dumped once per ASIN, so a misread page is diagnosable from
+      // ground truth instead of a silent wall of identical failures.
+      if (!/id=["']productTitle["']|id=["']title["']|<h1[^>]*id=["']title/i.test(html)) {
+        try {
+          const fs = await import('node:fs');
+          const dir = '/tmp/opencode/failed-html';
+          fs.mkdirSync(dir, { recursive: true });
+          const asinMatch = url.match(/\/dp\/([A-Z0-9]{10})/);
+          const tag = isGatePage(lower) ? 'GATE-' : '';
+          const file = `${dir}/${tag}${asinMatch?.[1] ?? 'page'}.html`;
+          if (!fs.existsSync(file)) fs.writeFileSync(file, html);
+        } catch {
+          // Diagnostics must never break the scrape.
+        }
+      }
+
       const hasProduct = /id=["']productTitle["']|id=["']title["']|<h1[^>]*id=["']title/i.test(html);
       const marker = hasProduct ? undefined : BOT_CHECK_MARKERS.find((candidate) => lower.includes(candidate));
       if (marker) {
@@ -583,6 +687,21 @@ export class ScrapeWorker {
    * Run `task` inside a fresh context so cookies never leak between calls and
    * memory is released as soon as the scrape finishes.
    */
+  /**
+   * A long-lived browser context for one marketplace, for callers that scrape
+   * many ASINs in a row (the bulk job runner).
+   *
+   * Reusing one context per marketplace is what makes the localisation fast
+   * path fire: the currency cookie and delivery destination are set once, and
+   * every later page loads already-localised instead of paying the destination
+   * modal round-trip per ASIN. The caller owns the context's lifetime; the
+   * runner drops it when a restriction suggests the session went bad.
+   */
+  async createReusableContext(marketplace: Marketplace): Promise<BrowserContext> {
+    const browser = await this.getBrowser();
+    return createLocalizedContext(browser, marketplace);
+  }
+
   private async withPage<T>(
     marketplace: Marketplace,
     task: (page: Page, context: BrowserContext) => Promise<T>,
@@ -699,6 +818,11 @@ export class ScrapeWorker {
       const wantTitleEn = want('titleEn');
       const wantBuyBox = want('buyBoxSellerName') || want('buyBoxSellerPrice') || want('buyBoxSellerId') || want('isBuyBox') || want('buyBoxShipping') || want('buyBoxTotal') || want('buyBoxRating') || want('buyBoxFeedback') || want('buyBoxFulfillment') || want('buyBoxCondition') || want('buyBoxStock');
       const wantOffers = want('otherSellers') || want('buyBoxSellerName') || want('buyBoxSellerPrice');
+      const wantVariations =
+        want('variationAsin') ||
+        want('variationType') ||
+        want('variationNote') ||
+        want('variationsComplete');
 
       // --- English title (best-effort) ---
       if (wantTitleEn && !product.titleEn && process.env.SERPAPI_API_KEY) {
@@ -834,11 +958,19 @@ export class ScrapeWorker {
         { attributes: {}, price: product.price },
       ];
       const variationSnapshots: ProductWithOffers[] = [];
-      let variationsComplete = true;
+      let variationsComplete: boolean | null = true;
       let variationNote: string | null = null;
       let requiredTypes: string[] = product.selectionTypes ?? [];
 
-      if (this.explorationAllowed()) {
+      // Variation exploration costs up to MAX_VARIATIONS extra page loads per
+      // ASIN (a click plus a paced navigation each), so it only runs when some
+      // variation field was actually requested. A job that selected a column
+      // subset without variation columns — the common deliverable case — gets
+      // one product page and the offers page, nothing more.
+      if (!wantVariations) {
+        variationsComplete = null;
+        variationNote = 'Variation exploration skipped: no variation fields were requested.';
+      } else if (this.explorationAllowed()) {
         const discovery = await discoverVariations(page).catch(() => null);
 
         if (discovery?.hasVariations) {

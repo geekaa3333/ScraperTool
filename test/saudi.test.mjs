@@ -188,6 +188,10 @@ test('Saudi uploads never inherit the Cairo destination', async () => {
     blockedForSeconds() {
       return this._blocked;
     },
+    async createReusableContext() {
+      // Stand-in for the long-lived per-marketplace browser context.
+      return { closed: false, async close() {} };
+    },
     async scrapeProduct(asin, destination, marketplace) {
       return {
         asin,

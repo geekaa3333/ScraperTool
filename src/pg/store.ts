@@ -1125,7 +1125,9 @@ export class PostgresStore implements DataStore {
         (product.variationAsin as string) ?? null,
         JSON.stringify(product.variationAttributes ?? null),
         (product.variationNote as string) ?? null,
-        product.variationsComplete === undefined ? null : Boolean(product.variationsComplete),
+        product.variationsComplete === undefined || product.variationsComplete === null
+          ? null
+          : Boolean(product.variationsComplete),
         product.buyingOptionsOpened === undefined ? null : Boolean(product.buyingOptionsOpened),
         // Price provenance, so a wrong price can be traced to a source.
         (product.priceSource as string) ?? null,

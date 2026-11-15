@@ -429,7 +429,11 @@ test('a persistent mismatch fails after the retry budget, not before', async () 
     { log: silent, retries: 1 },
   );
   // One initial read plus one retry: enough to be controlled, not endless.
-  assert.equal(reads, 2);
+  // The added read is the cheap pre-check that can return early without
+  // touching anything when the page already matches; the RELOAD count is the
+  // real retry budget and stays at exactly one per configured retry.
+  assert.equal(reads, 3);
+  assert.equal(page.calls.reloaded, 2);
   assert.equal(result.ok, false);
 });
 

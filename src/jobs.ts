@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { BrowserContext } from 'playwright';
 import type { Store } from './db.js';
 import type { ProductWithOffers } from './types.js';
 import { destinationForMarketplace, type ScrapeWorker } from './worker.js';
@@ -156,6 +157,39 @@ export class BulkRunner {
   ) {}
 
   /**
+   * One long-lived browser context per marketplace, reused across ASINs.
+   *
+   * A reused context is what makes localisation take its fast path: the
+   * currency cookie and delivery destination are set once, so every later page
+   * loads already-localised instead of paying the destination modal round-trip
+   * per ASIN. The map is bounded by the marketplace count, so nothing
+   * accumulates. Contexts are dropped when a restriction suggests the session
+   * went bad — poisoned cookies must not outlive the incident that caused them.
+   */
+  private contexts = new Map<MarketplaceId, BrowserContext>();
+
+  private async contextFor(marketplaceId: MarketplaceId): Promise<BrowserContext> {
+    let context = this.contexts.get(marketplaceId);
+    if (!context) {
+      context = await this.worker.createReusableContext(getMarketplace(marketplaceId));
+      this.contexts.set(marketplaceId, context);
+    }
+    return context;
+  }
+
+  /**
+   * Close and forget every cached context. Called when Amazon restricts access:
+   * the block is global, so a session that hit a challenge is not trusted again
+   * even after the pacing breaker recovers.
+   */
+  private dropAllContexts(): void {
+    for (const [id, context] of this.contexts) {
+      this.contexts.delete(id);
+      context.close().catch(() => undefined);
+    }
+  }
+
+  /**
    * Start (or resume) processing a job.
    *
    * Returns immediately; work proceeds in the background. Calling this twice is
@@ -210,6 +244,33 @@ export class BulkRunner {
     this.store.setBulkJobStatus(jobId, 'paused');
   }
 
+  /**
+   * Self-healing for unattended runs: a restriction pause is a cooldown, not a
+   * decision. When the block window expires the batch resumes on its own. A
+   * manual pause always clears `pausedReason`, a resume sets the status to
+   * `running`, and a cancel sets `cancelled` — so this timer can never
+   * override a human. If the restriction returns, the pause re-schedules
+   * another cooldown instead of hammering Amazon.
+   */
+  private scheduleAutoResume(jobId: string): void {
+    const waitMs = Math.max(this.worker.blockedForSeconds(), 0) * 1000 + 45_000;
+    setTimeout(() => {
+      try {
+        const job = this.store.getBulkJob(jobId);
+        if (!job || job.status !== 'paused' || !job.pausedReason) return;
+        if (!/captcha|403|429|503|restrict/i.test(job.pausedReason)) return;
+        if (activeLoops.has(jobId)) return;
+        console.log(
+          `[auto-resume] ${jobId}: restriction window elapsed — resuming automatically.`,
+        );
+        this.start(jobId);
+      } catch {
+        // A failed self-resume must never crash the server; the job simply
+        // stays paused until someone presses Resume.
+      }
+    }, waitMs).unref();
+  }
+
   private async loop(jobId: string, control: LoopControl): Promise<void> {
     const job = this.store.getBulkJob(jobId);
     if (!job) return;
@@ -232,19 +293,18 @@ export class BulkRunner {
       if (!item) break;
 
       // A block raised by an earlier ASIN must stop the batch, not be reported
-      // as a successful scrape.
+      // as a successful scrape — and the claimed item goes back to the queue:
+      // it never got an honest attempt, so failing it here would fabricate an
+      // absence that a resume can still scrape correctly.
       if (this.worker.blockedForSeconds() > 0) {
-        this.store.failBulkItem(
-          jobId,
-          item.marketplaceId,
-          item.asin,
-          this.worker.blockReason ?? 'Amazon access is restricted; batch paused.',
-        );
+        this.store.resetStuckBulkItems(jobId);
+        this.dropAllContexts();
         this.store.setBulkJobStatus(jobId, 'paused', {
           pausedReason:
             this.worker.blockReason ??
             'Amazon restricted automated access. Processing paused; retry when access resumes.',
         });
+        this.scheduleAutoResume(jobId);
         return;
       }
 
@@ -268,6 +328,7 @@ export class BulkRunner {
             sourceFile: item.sourceFile,
             selectedFields: job.selectedFields ?? undefined,
           },
+          await this.contextFor(item.marketplaceId),
         );
 
         control.currentCheck = null;
@@ -280,16 +341,23 @@ export class BulkRunner {
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         control.currentCheck = null;
-        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, reason);
 
         // A restriction is a stop condition for the whole batch, not just one
-        // ASIN — continuing would hammer Amazon while it is refusing us.
+        // ASIN — continuing would hammer Amazon while it is refusing us. The
+        // claimed item returns to the queue instead of being burned: it never
+        // got an honest attempt, so a permanent failure would fabricate an
+        // absence that a resume can still scrape correctly.
         if (/captcha|403|429|503|paused|restricted/i.test(reason)) {
+          this.store.resetStuckBulkItems(jobId);
+          this.dropAllContexts();
           this.store.setBulkJobStatus(jobId, 'paused', {
             pausedReason: `${reason} — processing paused to respect Amazon's restriction.`,
           });
+          this.scheduleAutoResume(jobId);
           return;
         }
+
+        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, reason);
       }
     }
 
@@ -350,6 +418,7 @@ export class BulkRunner {
           this.store.setBulkJobStatus(jobId, 'paused', {
             pausedReason: this.worker.blockReason ?? 'Amazon restricted access during detection.',
           });
+          this.scheduleAutoResume(jobId);
           return;
         }
         control.currentCheck = { asin, marketplaceId };
@@ -403,10 +472,14 @@ export class BulkRunner {
       if (!item) return;
 
       if (this.worker.blockedForSeconds() > 0) {
-        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, this.worker.blockReason ?? 'restricted');
+        // The claimed item goes back to the queue — pausing must not turn a
+        // restriction into a permanent "product not found" record.
+        this.store.resetStuckBulkItems(jobId);
+        this.dropAllContexts();
         this.store.setBulkJobStatus(jobId, 'paused', {
           pausedReason: this.worker.blockReason ?? 'Amazon restricted access.',
         });
+        this.scheduleAutoResume(jobId);
         return;
       }
 
@@ -422,20 +495,25 @@ export class BulkRunner {
           sourceRow: item.rowNumber,
           sourceFile: item.sourceFile,
           selectedFields: this.store.getBulkJob(jobId)?.selectedFields ?? undefined,
-        });
+        }, await this.contextFor(item.marketplaceId));
         control.currentCheck = null;
         this.store.completeBulkItem(jobId, product);
         this.store.save(product);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         control.currentCheck = null;
-        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, reason);
+        // Restrictions pause the batch with the claimed item re-queued, not
+        // burned — the loop path documents the same reasoning.
         if (/captcha|403|429|503|paused|restricted/i.test(reason)) {
+          this.store.resetStuckBulkItems(jobId);
+          this.dropAllContexts();
           this.store.setBulkJobStatus(jobId, 'paused', {
             pausedReason: `${reason} — processing paused.`,
           });
+          this.scheduleAutoResume(jobId);
           return;
         }
+        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, reason);
       }
     }
   }
@@ -523,6 +601,7 @@ export class BulkRunner {
               this.worker.blockReason ??
               'Amazon restricted access during marketplace detection. Detection stopped.',
           });
+          this.scheduleAutoResume(jobId);
           return outcomes;
         }
 

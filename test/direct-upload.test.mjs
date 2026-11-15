@@ -54,6 +54,10 @@ function makeRunner(store, hooks = {}) {
     blockedForSeconds() {
       return this._blocked;
     },
+    async createReusableContext() {
+      // Stand-in for the long-lived per-marketplace browser context.
+      return { closed: false, async close() {} };
+    },
     async scrapeProduct(asin, destination, marketplace, options) {
       calls.scrapeProduct.push({ asin, marketplaceId: marketplace.id, destination });
 

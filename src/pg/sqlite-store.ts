@@ -1338,7 +1338,9 @@ export class SqliteStore implements DataStore {
           (product.variationNote as string) ?? null,
           // Unknown (null) when never collected, so historical rows are not
           // retroactively claimed as fully explored.
-          product.variationsComplete === undefined ? null : boolInt(product.variationsComplete),
+          product.variationsComplete === undefined || product.variationsComplete === null
+            ? null
+            : boolInt(product.variationsComplete),
           product.buyingOptionsOpened === undefined ? null : boolInt(product.buyingOptionsOpened),
           (product.priceSource as string) ?? null,
           (product.priceSelector as string) ?? null,
