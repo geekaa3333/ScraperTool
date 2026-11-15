@@ -306,6 +306,11 @@ class RequestQueue {
     return this.samples.length;
   }
 
+  // Hard ceiling on a single queued task so a hung navigation can never pin
+  // the tail forever (which previously stalled every lane at once). Anything
+  // that does not resolve within this window is abandoned and the tail advances.
+  private static readonly TASK_TIMEOUT_MS = 120_000;
+
   async run<T>(task: () => Promise<T>): Promise<T> {
     while (this.active >= MAX_CONCURRENCY) {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -316,7 +321,14 @@ class RequestQueue {
     this.tail = new Promise<void>((resolve) => {
       release = resolve;
     });
-    await previous;
+
+    // Never let a stuck predecessor pin this call forever.
+    await Promise.race([
+      previous,
+      new Promise<void>((resolve) =>
+        setTimeout(resolve, RequestQueue.TASK_TIMEOUT_MS),
+      ),
+    ]).catch(() => undefined);
 
     // The minimum interval is a hard floor.
     const sinceLast = Date.now() - this.lastRequestAt;
@@ -327,7 +339,12 @@ class RequestQueue {
     const wait = floor + jitter;
     if (wait > 0) {
       const waitStarted = process.hrtime.bigint();
-      await new Promise((resolve) => setTimeout(resolve, wait));
+      await Promise.race([
+        new Promise<void>((resolve) => setTimeout(resolve, wait)),
+        new Promise<void>((resolve) =>
+          setTimeout(resolve, RequestQueue.TASK_TIMEOUT_MS),
+        ),
+      ]);
       // Pacing wait is measured, not guessed. It is usually the largest single
       // cost in a batch and must never be confused with work we can optimise.
       recordTiming(
@@ -343,9 +360,17 @@ class RequestQueue {
     if (this.samples.length > 500) this.samples.shift();
 
     try {
-      return await task();
+      return await Promise.race([
+        task(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error('request timed out after 120s')),
+            RequestQueue.TASK_TIMEOUT_MS,
+          ),
+        ),
+      ]);
     } finally {
-      this.active -= 1;
+      this.active = Math.max(0, this.active - 1);
       release();
     }
   }

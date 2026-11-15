@@ -263,7 +263,7 @@ export class BulkRunner {
       try {
         const job = this.store.getBulkJob(jobId);
         if (!job || job.status !== 'paused' || !job.pausedReason) return;
-        if (!/captcha|403|429|503|restrict/i.test(job.pausedReason)) return;
+        if (!/captcha|403|429|503|restrict|timeout/i.test(job.pausedReason)) return;
         if (activeLoops.has(jobId)) return;
         console.log(
           `[auto-resume] ${jobId}: restriction window elapsed — resuming automatically.`,
@@ -390,12 +390,14 @@ export class BulkRunner {
         const reason = error instanceof Error ? error.message : String(error);
         control.currentCheck = null;
 
-        // A restriction is a stop condition for the whole batch, not just one
-        // ASIN — continuing would hammer Amazon while it is refusing us. The
-        // claimed item returns to the queue instead of being burned: it never
-        // got an honest attempt, so a permanent failure would fabricate an
-        // absence that a resume can still scrape correctly.
-        if (/captcha|403|429|503|paused|restricted/i.test(reason)) {
+        // A restriction OR a hung request (timeout) is a stop condition for the
+        // whole batch: continuing would hammer Amazon while it is refusing us,
+        // or stall forever on a connection that never resolves. The claimed
+        // items return to the queue instead of being burned.
+        if (
+          /captcha|403|429|503|paused|restricted/i.test(reason) ||
+          /timed out/i.test(reason)
+        ) {
           if (!stopped.value) {
             stopped.value = true;
             this.store.resetStuckBulkItems(jobId);
