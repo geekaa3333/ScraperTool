@@ -166,13 +166,18 @@ export class BulkRunner {
    * accumulates. Contexts are dropped when a restriction suggests the session
    * went bad — poisoned cookies must not outlive the incident that caused them.
    */
-  private contexts = new Map<MarketplaceId, BrowserContext>();
+  private contexts = new Map<string, BrowserContext>();
 
-  private async contextFor(marketplaceId: MarketplaceId): Promise<BrowserContext> {
-    let context = this.contexts.get(marketplaceId);
+  // Completion timestamps per job, used for a recent-window ETA that is not
+  // poisoned by stalls, restarts or block cooldowns earlier in the run.
+  private completionTimes = new Map<string, number[]>();
+
+  private async contextFor(marketplaceId: MarketplaceId, lane = 0): Promise<BrowserContext> {
+    const key = `${lane}:${marketplaceId}`;
+    let context = this.contexts.get(key);
     if (!context) {
       context = await this.worker.createReusableContext(getMarketplace(marketplaceId));
-      this.contexts.set(marketplaceId, context);
+      this.contexts.set(key, context);
     }
     return context;
   }
@@ -280,33 +285,75 @@ export class BulkRunner {
     this.store.resetStuckBulkItems(jobId);
     this.store.setBulkJobStatus(jobId, 'running');
 
+    // Run several independent lanes in parallel so the batch finishes inside
+    // the user's deadline. Each lane claims its own items atomically; a
+    // restriction in any lane pauses the whole batch and returns the in-flight
+    // items to the queue. Lane count is env-tunable (default 3) and capped at 4
+    // to keep Amazon's gate from tripping on every other request.
+    const parallel = Math.max(
+      1,
+      Math.min(4, Number(process.env.SELLERCTRL_PARALLEL ?? 3)),
+    );
+    const stopped = { value: false };
+    const lanes = Array.from({ length: parallel }, (_, lane) =>
+      this.workerLane(jobId, lane, control, stopped),
+    );
+    await Promise.all(lanes);
+
+    const final = this.store.getBulkJob(jobId);
+    if (
+      final &&
+      final.pending === 0 &&
+      !control.cancelled &&
+      !stopped.value
+    ) {
+      this.store.setBulkJobStatus(jobId, 'completed');
+    }
+  }
+
+  private async workerLane(
+    jobId: string,
+    lane: number,
+    control: LoopControl,
+    stopped: { value: boolean },
+  ): Promise<void> {
     for (;;) {
       if (control.cancelled) {
-        const current = this.store.getBulkJob(jobId);
-        if (current && current.status === 'running') {
-          this.store.setBulkJobStatus(jobId, 'paused');
+        if (!stopped.value) {
+          stopped.value = true;
+          const current = this.store.getBulkJob(jobId);
+          if (current && current.status === 'running') {
+            this.store.setBulkJobStatus(jobId, 'paused');
+          }
         }
         return;
       }
+      if (stopped.value) return;
 
       const item = this.store.claimNextBulkItem(jobId);
-      if (!item) break;
+      if (!item) return;
 
       // A block raised by an earlier ASIN must stop the batch, not be reported
       // as a successful scrape — and the claimed item goes back to the queue:
       // it never got an honest attempt, so failing it here would fabricate an
       // absence that a resume can still scrape correctly.
       if (this.worker.blockedForSeconds() > 0) {
-        this.store.resetStuckBulkItems(jobId);
-        this.dropAllContexts();
-        this.store.setBulkJobStatus(jobId, 'paused', {
-          pausedReason:
-            this.worker.blockReason ??
-            'Amazon restricted automated access. Processing paused; retry when access resumes.',
-        });
-        this.scheduleAutoResume(jobId);
+        if (!stopped.value) {
+          stopped.value = true;
+          this.store.resetStuckBulkItems(jobId);
+          this.dropAllContexts();
+          this.store.setBulkJobStatus(jobId, 'paused', {
+            pausedReason:
+              this.worker.blockReason ??
+              'Amazon restricted automated access. Processing paused; retry when access resumes.',
+          });
+          this.scheduleAutoResume(jobId);
+        }
         return;
       }
+
+      const job = this.store.getBulkJob(jobId);
+      if (!job) return;
 
       // Resolved per item, not once per job: a mixed batch must never apply one
       // marketplace's destination to another's rows.
@@ -328,7 +375,7 @@ export class BulkRunner {
             sourceFile: item.sourceFile,
             selectedFields: job.selectedFields ?? undefined,
           },
-          await this.contextFor(item.marketplaceId),
+          await this.contextFor(item.marketplaceId, lane),
         );
 
         control.currentCheck = null;
@@ -338,6 +385,7 @@ export class BulkRunner {
         // same marketplace-scoped cache the manual search reads.
         this.store.save(product);
         recordTiming('save', Number(process.hrtime.bigint() - saveStarted) / 1e6);
+        this.recordCompletion(jobId);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         control.currentCheck = null;
@@ -348,23 +396,29 @@ export class BulkRunner {
         // got an honest attempt, so a permanent failure would fabricate an
         // absence that a resume can still scrape correctly.
         if (/captcha|403|429|503|paused|restricted/i.test(reason)) {
-          this.store.resetStuckBulkItems(jobId);
-          this.dropAllContexts();
-          this.store.setBulkJobStatus(jobId, 'paused', {
-            pausedReason: `${reason} — processing paused to respect Amazon's restriction.`,
-          });
-          this.scheduleAutoResume(jobId);
+          if (!stopped.value) {
+            stopped.value = true;
+            this.store.resetStuckBulkItems(jobId);
+            this.dropAllContexts();
+            this.store.setBulkJobStatus(jobId, 'paused', {
+              pausedReason: `${reason} — processing paused to respect Amazon's restriction.`,
+            });
+            this.scheduleAutoResume(jobId);
+          }
           return;
         }
 
         this.store.failBulkItem(jobId, item.marketplaceId, item.asin, reason);
+        this.recordCompletion(jobId);
       }
     }
+  }
 
-    const final = this.store.getBulkJob(jobId);
-    if (final && final.pending === 0 && !control.cancelled) {
-      this.store.setBulkJobStatus(jobId, 'completed');
-    }
+  private recordCompletion(jobId: string): void {
+    const arr = this.completionTimes.get(jobId) ?? [];
+    arr.push(Date.now());
+    if (arr.length > 500) arr.splice(0, arr.length - 500);
+    this.completionTimes.set(jobId, arr);
   }
 
   /**
@@ -729,12 +783,21 @@ export class BulkRunner {
         : Math.round(((detectionCompleted + scraped + scrapeFailed) /
             (detectionTotal + extractionTotal)) * 1000) / 10;
 
-    // ETA is measured, never guessed, and never shown before two samples exist.
+    // ETA is measured from the last 15 minutes only: the whole-job average is
+    // permanently poisoned by stalls, restarts and block cooldowns earlier in
+    // the run, so extrapolating it makes a healthy batch look dead (e.g. "80h").
     let extractionEta: number | null = null;
-    if (job.startedAt && scraped >= 2 && extractionRemaining > 0) {
-      const elapsedMs = Date.now() - Date.parse(job.startedAt);
-      if (elapsedMs > 0) {
-        extractionEta = Math.round((elapsedMs / (scraped + scrapeFailed)) * extractionRemaining) / 1000;
+    const times = this.completionTimes.get(jobId) ?? [];
+    const windowMs = 15 * 60 * 1000;
+    const windowCutoff = Date.now() - windowMs;
+    const recentTimes = times.filter((t) => t >= windowCutoff);
+    if (recentTimes.length >= 3 && extractionRemaining > 0) {
+      const last = recentTimes[recentTimes.length - 1]!;
+      const first = recentTimes[0]!;
+      const span = last - first;
+      const perItemMs = span > 0 ? span / (recentTimes.length - 1) : windowMs / recentTimes.length;
+      if (perItemMs > 0) {
+        extractionEta = Math.round((perItemMs * extractionRemaining) / 1000);
       }
     }
 
