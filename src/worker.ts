@@ -270,7 +270,7 @@ const GATE_PAGE_MARKERS = [
 const GATE_FORM_SELECTOR = 'form[action*="validateCaptcha"]';
 const GATE_BUTTON_SELECTOR = `${GATE_FORM_SELECTOR} button, ${GATE_FORM_SELECTOR} input[type="submit"]`;
 /** Presses allowed before the session is declared genuinely throttled. */
-const GATE_PRESS_BUDGET = 2;
+const GATE_PRESS_BUDGET = 3;
 /** Ready-wait after a press; a press responds in a second or two, not fifteen. */
 const GATE_RETRY_READY_MS = 12_000;
 
@@ -941,10 +941,6 @@ export class ScrapeWorker {
       let parsed: ReturnType<typeof parseOffers>;
       if (wantOffers) {
         const offersHtml = await this.fetchHtml(page, offersPage, OFFERS_READY_SELECTOR);
-        try {
-          const fs = await import('node:fs');
-          fs.writeFileSync('/tmp/opencode/debug_offers3_' + asin + '.html', offersHtml);
-        } catch {}
         const offersParseStarted = process.hrtime.bigint();
         parsed = parseOffers(offersHtml, {
           asin,
