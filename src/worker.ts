@@ -270,7 +270,7 @@ const GATE_PAGE_MARKERS = [
 const GATE_FORM_SELECTOR = 'form[action*="validateCaptcha"]';
 const GATE_BUTTON_SELECTOR = `${GATE_FORM_SELECTOR} button, ${GATE_FORM_SELECTOR} input[type="submit"]`;
 /** Presses allowed before the session is declared genuinely throttled. */
-const GATE_PRESS_BUDGET = 3;
+const GATE_PRESS_BUDGET = 5;
 /** Ready-wait after a press; a press responds in a second or two, not fifteen. */
 const GATE_RETRY_READY_MS = 12_000;
 
@@ -612,12 +612,13 @@ export class ScrapeWorker {
       const contentStarted = process.hrtime.bigint();
       let html = await page.content();
       let lower = html.toLowerCase();
+      let hasProduct = /id=["']productTitle["']|id=["']title["']|<h1[^>]*id=["']title/i.test(html);
 
       // The "Continue shopping" gate misreads as "no product" if it reaches the
       // parser, which used to permanently fail healthy ASINs at 15 s each.
       // Press the site's own button instead — the human path — and re-capture.
-      if (isGatePage(lower)) {
-        for (let press = 1; press <= GATE_PRESS_BUDGET && isGatePage(lower); press++) {
+      if (isGatePage(lower) && !hasProduct) {
+        for (let press = 1; press <= GATE_PRESS_BUDGET && isGatePage(lower) && !hasProduct; press++) {
           console.log(`[gate] pressing Amazon's "Continue shopping" button (attempt ${press}/${GATE_PRESS_BUDGET})`);
           try {
             await page.locator(GATE_BUTTON_SELECTOR).first().click({ timeout: 5_000 });
@@ -632,6 +633,7 @@ export class ScrapeWorker {
             .catch(() => undefined);
           html = await page.content();
           lower = html.toLowerCase();
+          hasProduct = /id=["']productTitle["']|id=["']title["']|<h1[^>]*id=["']title/i.test(html);
         }
 
         if (!isGatePage(lower)) {
@@ -657,7 +659,7 @@ export class ScrapeWorker {
 
         // Still gated after the presses: the session is genuinely throttled.
         // Pausing honestly beats recording a wall of "product not found" rows.
-        if (isGatePage(lower)) {
+        if (isGatePage(lower) && !hasProduct) {
           this.tripBlock(`Amazon kept serving the "Continue shopping" gate for ${url}`);
           throw new AccessRestrictedError(
             'Amazon is serving a persistent "Continue shopping" gate instead of the page (access restricted).',
@@ -690,7 +692,7 @@ export class ScrapeWorker {
         }
       }
 
-      const hasProduct = /id=["']productTitle["']|id=["']title["']|<h1[^>]*id=["']title/i.test(html);
+      // hasProduct already computed/updated above.
       const marker = hasProduct ? undefined : BOT_CHECK_MARKERS.find((candidate) => lower.includes(candidate));
       if (marker) {
         this.tripBlock(`Amazon served a bot challenge for ${url}`);
@@ -708,6 +710,30 @@ export class ScrapeWorker {
         readySelector === OFFERS_READY_SELECTOR ? 'offers-nav' : 'product-nav',
         Number(process.hrtime.bigint() - contentStarted) / 1e6,
       );
+
+      // Retry once when Amazon served a page with no product title (partial
+      // render / soft gate that the press loop did not fully clear). A fresh
+      // navigation often gets a fully-rendered page.
+      if (
+        !hasProduct &&
+        !isGatePage(lower) &&
+        !(marker)
+      ) {
+        try {
+          const retryResponse = await page.goto(url, { waitUntil: 'commit', timeout: NAV_TIMEOUT_MS });
+          if (retryResponse && retryResponse.status() === 200) {
+            await page
+              .waitForSelector(waitSelector, { state: 'attached', timeout: READY_TIMEOUT_MS })
+              .catch(() => undefined);
+            const retryHtml = await page.content();
+            if (/id=["']productTitle["']|id=["']title["']|<h1[^>]*id=["']title/i.test(retryHtml)) {
+              return retryHtml;
+            }
+          }
+        } catch {
+          // Retry is best-effort; fall through to the original capture.
+        }
+      }
 
       return html;
     });
@@ -899,11 +925,17 @@ export class ScrapeWorker {
           // the seller, while a "Ships from Amazon, Sold by X" page resolves
           // to X. Raw text is only used when it is not a "ships from" placeholder.
           const soldByMatch =
-            /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by)\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:rated|rating)\b|$)/i.exec(
+            /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by|shipper\s*\/?\s*seller)\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:rated|rating)\b|$)/i.exec(
               text,
             );
           let name = soldByMatch?.[1]?.replace(/\s+/g, ' ').trim() ?? null;
           if (!name && !/^ships\s+from\b/i.test(text)) name = text;
+          // Newer layouts print "Shipper / Seller Amazon.com Amazon.com Shipper /
+          // Seller Amazon.com" — collapse that to a single clean seller name.
+          if (name && /shipper/i.test(name)) {
+            const cleaned = name.replace(/.*(?:shipper|seller)\s*\/?\s*(?:shipper|seller)?\s*/i, '').trim();
+            if (cleaned) name = cleaned;
+          }
 
           if (name) {
             buyBoxSellerName = name;
