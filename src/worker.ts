@@ -147,6 +147,7 @@ export const DESTINATIONS: Destination[] = [
   { id: 'paris', label: 'Paris, France', countryCode: 'FR', amazonLabel: 'Paris', postalCode: '75001', verified: true },
   { id: 'toronto', label: 'Toronto, Canada', countryCode: 'CA', amazonLabel: 'Toronto', postalCode: 'M5V', verified: true },
   { id: 'newyork', label: 'New York, USA', countryCode: 'US', amazonLabel: 'New York', postalCode: '10001', verified: true },
+  { id: 'um', label: 'United States Minor Outlying Islands', countryCode: 'US', amazonLabel: 'United States Minor Outlying Islands', postalCode: null, verified: false },
 ];
 
 /**
