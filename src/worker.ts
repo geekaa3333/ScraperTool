@@ -578,13 +578,50 @@ export class ScrapeWorker {
         );
       }
       if (status === 503) {
-        this.tripBlock(`Amazon returned HTTP 503 for ${url}`);
-        throw new AccessRestrictedError(
-          'Amazon returned HTTP 503.',
-          'http-503',
-          status,
-          'This usually means the marketplace is rate-limiting automated browsers.',
-        );
+        // 503 is often transient (Amazon's edge shedding load). Retry with
+        // exponential backoff before declaring a hard block, so a single
+        // 503 does not kill the whole batch.
+        const retryBudget = 3;
+        let lastStatus = status;
+        for (let attempt = 1; attempt <= retryBudget; attempt++) {
+          const delay = Math.min(2000 * Math.pow(2, attempt - 1), 16000);
+          console.log(`[retry] HTTP 503 for ${url} — attempt ${attempt}/${retryBudget}, waiting ${delay}ms`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          this.assertNotBlocked();
+          const retryResponse = await page.goto(url, { waitUntil: 'commit', timeout: NAV_TIMEOUT_MS });
+          if (!retryResponse) break;
+          lastStatus = retryResponse.status();
+          if (lastStatus !== 503) {
+            // Recovered — fall through to normal handling below.
+            // Re-assign response/status so the rest of fetchHtml runs normally.
+            // We can't reassign const, so handle inline:
+            if (lastStatus === 403) {
+              this.tripBlock(`Amazon returned HTTP 403 for ${url}`);
+              throw new AccessRestrictedError('Amazon returned HTTP 403 (access denied).', 'http-403', lastStatus, 'Automated access was refused.');
+            }
+            if (lastStatus === 429) {
+              this.tripBlock(`Amazon returned HTTP 429 for ${url}`);
+              throw new AccessRestrictedError('Amazon returned HTTP 429 (too many requests).', 'http-429', lastStatus, 'Slow down and retry later.');
+            }
+            if (lastStatus === 404) {
+              throw Object.assign(new AmazonScraperError(`Page not found (404): ${url}`), {
+                pageState: 'NOT_FOUND',
+                pageStateReason: 'Amazon answered HTTP 404 for this product page.',
+              });
+            }
+            // Success (200 etc.) — continue to normal flow.
+            break;
+          }
+        }
+        if (lastStatus === 503) {
+          this.tripBlock(`Amazon returned HTTP 503 for ${url} after ${retryBudget} retries`);
+          throw new AccessRestrictedError(
+            'Amazon returned HTTP 503.',
+            'http-503',
+            503,
+            'This usually means the marketplace is rate-limiting automated browsers.',
+          );
+        }
       }
       if (status === 404) {
         // Distinct from a block: the product genuinely is not on this site.
