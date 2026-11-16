@@ -331,7 +331,10 @@ export function productUrl(marketplace: Marketplace, asin: string): string {
 
 /** Canonical all-offers page URL. */
 export function offersUrl(marketplace: Marketplace, asin: string): string {
-  return `${originOf(marketplace)}${marketplace.offersPath}${asin}`;
+  // `?ie=UTF8&condition=all` forces Amazon's modern "all offers display" (aod=1)
+  // render, which carries the `#aod-offer` / `#aod-pinned-offer` rows. Without it
+  // the request redirects to the bare product page and the seller list is empty.
+  return `${originOf(marketplace)}${marketplace.offersPath}${asin}?ie=UTF8&condition=all`;
 }
 
 /** Canonical search URL. */

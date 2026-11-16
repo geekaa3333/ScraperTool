@@ -184,7 +184,11 @@ export function destinationForMarketplace(
   marketplace: Marketplace,
   destinationId: string | null | undefined,
 ): Destination | null {
-  if (!destinationId) return null;
+  if (!destinationId) {
+    // No destination stated: use the marketplace's own verified default rather
+    // than Amazon's IP-based guess, which can land on the wrong country.
+    return defaultDestinationFor(marketplace);
+  }
   const found = DESTINATIONS.find((entry) => entry.id === destinationId);
   if (!found) return null;
   if (found.countryCode !== marketplace.deliveryCountryCode) return null;
@@ -936,6 +940,10 @@ export class ScrapeWorker {
       let parsed: ReturnType<typeof parseOffers>;
       if (wantOffers) {
         const offersHtml = await this.fetchHtml(page, offersPage, OFFERS_READY_SELECTOR);
+        try {
+          const fs = await import('node:fs');
+          fs.writeFileSync('/tmp/opencode/debug_offers3_' + asin + '.html', offersHtml);
+        } catch {}
         const offersParseStarted = process.hrtime.bigint();
         parsed = parseOffers(offersHtml, {
           asin,
@@ -947,6 +955,16 @@ export class ScrapeWorker {
           buyBoxSellerName,
         });
         recordTiming('offers-parse', Number(process.hrtime.bigint() - offersParseStarted) / 1e6);
+
+        // The product page's buy-box seller block is often empty or messy on
+        // newer Amazon layouts (e.g. "Shipper / Seller Amazon.com Amazon.com
+        // Shipper / Seller Amazon.com"). The pinned offer on the offers page
+        // IS the Buy Box winner and carries a clean name — prefer it whenever
+        // offers were actually collected.
+        if (parsed.offers.length > 0) {
+          const winner = parsed.offers.find((o) => o.isBuyBox) ?? parsed.offers[0];
+          if (winner?.sellerName) buyBoxSellerName = winner.sellerName;
+        }
       } else {
         parsed = {
           offers: [],
@@ -1089,7 +1107,6 @@ export class ScrapeWorker {
 
       return {
         ...product,
-        domain: marketplace.domain,
         // NOT `marketplace.currency`. That overwrote whatever currency the page
         // actually displayed, which defeated mismatch detection entirely: a UK
         // page printing "EGP2,694.42" was relabelled GBP and the disagreement
@@ -1098,6 +1115,7 @@ export class ScrapeWorker {
         currency: product.currency ?? marketplace.currency,
         marketplaceId: marketplace.id,
         offers: parsed.offers,
+        buyBoxSellerName,
         // `parsed.complete` alone would ignore the buying-options expansion, so
         // an offer list we deliberately went and opened still reported itself
         // incomplete.

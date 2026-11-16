@@ -735,7 +735,7 @@ export function parseOffers(
     // every row silently discarded the Amazon-as-seller offer along with it.
     if (pinned && !sellerId && sellerName && /^amazon(\.[a-z.]+)?$/i.test(sellerName.trim())) {
       // Drop only when Amazon is the fulfilment origin, not the named seller.
-      const soldByAmazon = /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by|يُباع\s+من|يباع\s+من|بائعه)\s+(?:by\s+)?amazon/i.test(
+      const soldByAmazon = /(?:sold\s+by|ships\s+from(?:\s+and\s+sold\s+by)?|shipper\s*\/?\s*seller|seller|يُباع\s+من|يباع\s+من|بائعه)\s+(?:by\s+)?amazon/i.test(
         blockText,
       );
       if (!soldByAmazon) continue;

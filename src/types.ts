@@ -338,6 +338,8 @@ export interface SellerOffer {
 export interface ProductWithOffers extends ProductDetail {
   /** All offers visible to an anonymous shopper, best-effort. */
   offers: SellerOffer[];
+  /** Buy Box seller name, resolved from the product page or the pinned offer. */
+  buyBoxSellerName?: string | null;
   /** Requested field ids for this scrape. When absent, all fields are kept. */
   selectedFields?: string[] | null;
   /**
