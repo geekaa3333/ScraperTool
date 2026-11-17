@@ -1056,6 +1056,27 @@ export class ScrapeWorker {
             return false;
           }
         });
+        // Re-parse offers from the rendered DOM after the AOD widget loaded.
+        // The offers page previously returned 0 (loaded via AJAX after click).
+        if (buyingOptionsOpened) {
+          try {
+            const refreshedHtml = await page.content();
+            const refreshed = parseOffers(refreshedHtml, {
+              asin,
+              domain: marketplace.domain,
+              marketplaceId: marketplace.id,
+              now,
+              destination,
+              buyBoxSellerId,
+              buyBoxSellerName,
+            });
+            if (refreshed.offers.length > 0) {
+              parsed = refreshed;
+            }
+          } catch {
+            // Re-parse is best-effort; keep the previous result.
+          }
+        }
       }
 
       // --- variations ---
