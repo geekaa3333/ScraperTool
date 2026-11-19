@@ -40,6 +40,7 @@ import {
   type Marketplace,
   type MarketplaceId,
 } from './marketplaces.js';
+import { annotateProductQuality, recordCase, shouldRecordCase, stripInternalEvidence } from './diagnostics.js';
 
 /**
  * The scraping worker.
@@ -944,40 +945,80 @@ export class ScrapeWorker {
       if (wantBuyBox) try {
         const $ = cheerio.load(productHtml);
 
-        // Selectors are tried individually and the first *non-empty* one wins.
-        // A combined `.first()` returned an empty container because it appears
-        // earlier in the document than the populated element.
-        for (const selector of [
-          '#sellerProfileTriggerId',
-          '#tabular-buybox .tabular-buybox-text',
-          '#merchant-info',
-          '#merchantInfo a',
-          '#seller-name',
-          '#merchantInfoFeature_feature_div',
-        ]) {
-          const text = $(selector).first().text().replace(/\s+/g, ' ').trim();
-          if (!text) continue;
-
-          // Prefer "Sold by X" over raw text so Amazon is recognised when it is
-          // the seller, while a "Ships from Amazon, Sold by X" page resolves
-          // to X. Raw text is only used when it is not a "ships from" placeholder.
-          const soldByMatch =
-            /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by|shipper\s*\/?\s*seller)\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:rated|rating)\b|$)/i.exec(
-              text,
-            );
-          let name = soldByMatch?.[1]?.replace(/\s+/g, ' ').trim() ?? null;
-          if (!name && !/^ships\s+from\b/i.test(text)) name = text;
-          // Newer layouts print "Shipper / Seller Amazon.com Amazon.com Shipper /
-          // Seller Amazon.com" — collapse that to a single clean seller name.
-          if (name && /shipper/i.test(name)) {
-            const cleaned = name.replace(/.*(?:shipper|seller)\s*\/?\s*(?:shipper|seller)?\s*/i, '').trim();
+        const cleanBuyBoxName = (value: string | null | undefined): string | null => {
+          let name = (value ?? '').replace(/\s+/g, ' ').trim();
+          if (!name) return null;
+          // Newer layouts print "Shipper / Seller Amazon.com Amazon.com..." or
+          // repeat the seller name; collapse to the final meaningful token(s).
+          if (/shipper|seller\s*\/|\/\s*seller/i.test(name)) {
+            const cleaned = name
+              .replace(/.*(?:shipper|seller)\s*\/?\s*(?:shipper|seller)?\s*/i, '')
+              .trim();
             if (cleaned) name = cleaned;
           }
-
-          if (name) {
-            buyBoxSellerName = name;
-            break;
+          name = name.replace(/\s{2,}/g, ' ').trim();
+          // Deduplicate exact repeated phrase: "Amazon.com Amazon.com"
+          const parts = name.split(' ').filter(Boolean);
+          if (parts.length >= 2 && parts.length % 2 === 0) {
+            const half = parts.length / 2;
+            const left = parts.slice(0, half).join(' ');
+            const right = parts.slice(half).join(' ');
+            if (left === right) name = left;
           }
+          const normalized = (name || '').trim();
+          if (!normalized) return null;
+          // Reject UI control labels mistaken for seller names (e.g. Arabic "التفاصيل").
+          if (/^(details|detail|shipping rates?|learn more|store|visit the .*store)$/i.test(normalized)) return null;
+          if (/^(التفاصيل|تفاصيل|التفصيل|اعرف المزيد|معرفة المزيد|أسعار الشحن|المتجر|عرض المزيد|عرض أقل)$/u.test(normalized)) return null;
+          return normalized;
+        };
+
+        // Prefer explicit profile trigger link text when present.
+        const triggerName = cleanBuyBoxName($('#sellerProfileTriggerId').first().text());
+        if (triggerName) buyBoxSellerName = triggerName;
+
+        // Scan common buy-box/merchant blocks for "Sold by ..." evidence.
+        if (!buyBoxSellerName) {
+          const blocks = [
+            '#merchantInfoFeature_feature_div',
+            '#merchant-info',
+            '#tabular-buybox',
+            '#desktop_buybox',
+            '#buybox',
+            '#shipsFromSoldBy_feature_div',
+            '#fulfillerInfoFeature_feature_div',
+            '[data-feature-name="merchantInfoFeature"]',
+          ]
+            .flatMap((selector) => $(selector).toArray().map((el) => $(el).text().replace(/\s+/g, ' ').trim()))
+            .filter(Boolean);
+
+          for (const text of blocks) {
+            const soldByMatch =
+              /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by|shipper\s*\/?\s*seller)\s+(?:by\s+)?([^,()|]+?)(?=\s*(?:,\s*)?(?:Seller\s+rating\b|rated|rating|and\s+Fulfilled\b|Fulfilled\b|Ships\s+from\b|Details\b|التفاصيل\b|تفاصيل\b|$))/i.exec(
+                text,
+              ) ??
+              /(?:يُباع\s+من|يباع\s+من|بائعه)\s*([^،,()|]+?)(?=\s*(?:تقييم|تفاصيل|التفاصيل|Fulfilled|$))/iu.exec(text);
+            const candidate = cleanBuyBoxName(soldByMatch?.[1] ?? null);
+            if (candidate) {
+              buyBoxSellerName = candidate;
+              break;
+            }
+          }
+        }
+
+        // Last-resort: any seller-profile link with meaningful text in buybox area.
+        if (!buyBoxSellerName) {
+          const candidate = $('a[href*="seller="]')
+            .toArray()
+            .filter((el) => {
+              const href = $(el).attr('href') ?? '';
+              if (/\/gp\/aag\/details\//i.test(href)) return false;
+              if (/[?&]sshmPath=shipping-rates/i.test(href)) return false;
+              return true;
+            })
+            .map((el) => cleanBuyBoxName($(el).text()))
+            .find((name) => !!name && !/^(learn more|details|detail|shipping rates)$/i.test(name) && !/^(التفاصيل|تفاصيل|التفصيل|اعرف المزيد|معرفة المزيد|أسعار الشحن)$/u.test(name));
+          if (candidate) buyBoxSellerName = candidate;
         }
 
         // Scan every seller= link, not just the first — the first is often a
@@ -1022,6 +1063,48 @@ export class ScrapeWorker {
         });
         recordTiming('offers-parse', Number(process.hrtime.bigint() - offersParseStarted) / 1e6);
 
+        // Some offer-listing navigations redirect to an AOD view or render an
+        // empty shell while the DP already contains AOD/pinned offer markup.
+        // Fall back to parsing the captured product page when it yields offers.
+        if (parsed.offers.length === 0) {
+          const fromProductPage = parseOffers(productHtml, {
+            asin,
+            domain: marketplace.domain,
+            marketplaceId: marketplace.id,
+            now,
+            destination,
+            buyBoxSellerId,
+            buyBoxSellerName,
+          });
+          if (fromProductPage.offers.length > 0) {
+            parsed = fromProductPage;
+          }
+        }
+        // If the product page clearly indicates other sellers/offers (e.g.
+        // "New (N) from...") but extraction still returned zero, do a
+        // best-effort second pass against the offers page before giving up.
+        // This avoids reporting 0 competitors in the same pass when Amazon
+        // already advertises them.
+        if (parsed.offers.length === 0 && this.productIndicatesOtherOffers(product, productHtml)) {
+          try {
+            const retryOffersHtml = await this.fetchHtml(page, offersPage, OFFERS_READY_SELECTOR).catch(() => null);
+            if (retryOffersHtml) {
+              const retryParsed = parseOffers(retryOffersHtml, {
+                asin,
+                domain: marketplace.domain,
+                marketplaceId: marketplace.id,
+                now,
+                destination,
+                buyBoxSellerId,
+                buyBoxSellerName,
+              });
+              if (retryParsed.offers.length > 0) parsed = retryParsed;
+            }
+          } catch {
+            // best-effort
+          }
+        }
+
         // The product page's buy-box seller block is often empty or messy on
         // newer Amazon layouts (e.g. "Shipper / Seller Amazon.com Amazon.com
         // Shipper / Seller Amazon.com"). The pinned offer on the offers page
@@ -1030,6 +1113,7 @@ export class ScrapeWorker {
         if (parsed.offers.length > 0) {
           const winner = parsed.offers.find((o) => o.isBuyBox) ?? parsed.offers[0];
           if (winner?.sellerName) buyBoxSellerName = winner.sellerName;
+          if (!buyBoxSellerId && winner?.sellerId) buyBoxSellerId = winner.sellerId;
         }
       } else {
         parsed = {
@@ -1047,7 +1131,8 @@ export class ScrapeWorker {
       // choice to hide them rather than about the number of sellers.
       let buyingOptionsOpened = false;
       let buyingOptionsAttempted = false;
-      if (wantOffers && (parsed.offers.length === 0 || !parsed.complete)) {
+      const indicatesOtherOffers = wantOffers && this.productIndicatesOtherOffers(product, productHtml);
+      if (wantOffers && (parsed.offers.length === 0 || !parsed.complete || indicatesOtherOffers)) {
         buyingOptionsAttempted = true;
         buyingOptionsOpened = await this.withBuyingOptionBudget(async () => {
           try {
@@ -1072,6 +1157,9 @@ export class ScrapeWorker {
             });
             if (refreshed.offers.length > 0) {
               parsed = refreshed;
+              const winner = refreshed.offers.find((o) => o.isBuyBox) ?? refreshed.offers[0];
+              if (winner?.sellerName) buyBoxSellerName = winner.sellerName;
+              if (!buyBoxSellerId && winner?.sellerId) buyBoxSellerId = winner.sellerId;
             }
           } catch {
             // Re-parse is best-effort; keep the previous result.
@@ -1192,8 +1280,29 @@ export class ScrapeWorker {
             ? null
             : 'Amazon hid part of the offer list, so the sellers shown here may be incomplete.';
 
-      return {
+      // When the main product page hides price/stock behind "See All Buying Options"
+      // (or otherwise omits it), fall back to the Buy Box / first available offer so
+      // we still report the actual on-site price and seller instead of nulls.
+      const winnerOffer = parsed.offers.find((o) => o.isBuyBox) ?? parsed.offers[0] ?? null;
+      const enrichedPrice = product.price ?? winnerOffer?.price ?? null;
+      const enrichedPriceText = product.priceText ?? winnerOffer?.priceText ?? (enrichedPrice != null ? String(enrichedPrice) : null);
+      const enrichedBuyBoxSellerName = buyBoxSellerName ?? winnerOffer?.sellerName ?? null;
+      const enrichedAvailability = product.availability ?? null;
+      const enrichedAvailabilityMessage = product.availabilityMessage ?? product.availability ?? null;
+      const enrichedPriceStatus =
+        product.priceStatus && product.priceStatus !== 'NOT_AVAILABLE_IN_SOURCE' && product.priceStatus !== 'PARSING_FAILED'
+          ? product.priceStatus
+          : enrichedPrice != null
+            ? (buyingOptionsOpened || parsed.offers.length > 0 ? 'EXTRACTED' : product.priceStatus)
+            : product.priceStatus;
+
+      const result: any = {
         ...product,
+        price: enrichedPrice,
+        priceText: enrichedPriceText,
+        priceStatus: enrichedPriceStatus,
+        availability: enrichedAvailability,
+        availabilityMessage: enrichedAvailabilityMessage,
         // NOT `marketplace.currency`. That overwrote whatever currency the page
         // actually displayed, which defeated mismatch detection entirely: a UK
         // page printing "EGP2,694.42" was relabelled GBP and the disagreement
@@ -1202,7 +1311,7 @@ export class ScrapeWorker {
         currency: product.currency ?? marketplace.currency,
         marketplaceId: marketplace.id,
         offers: parsed.offers,
-        buyBoxSellerName,
+        buyBoxSellerName: enrichedBuyBoxSellerName,
         // `parsed.complete` alone would ignore the buying-options expansion, so
         // an offer list we deliberately went and opened still reported itself
         // incomplete.
@@ -1234,10 +1343,123 @@ export class ScrapeWorker {
           sourceRow: options.sourceRow ?? null,
           sourceFile: options.sourceFile ?? null,
         },
-      } satisfies ProductWithOffers;
+        // Internal: capped product-page HTML for case evidence (stripped before persistence/export).
+        _evidenceHtml: typeof productHtml === 'string' ? (productHtml.length > 800000 ? productHtml.slice(0, 800000) + '\n<!-- truncated -->' : productHtml) : null,
+      } as unknown as ProductWithOffers;
+
+      // Keepa fallback: when Amazon itself has no current price/stock/offers
+      // (e.g. "Currently unavailable"), try to record a confirmed external
+      // price instead of leaving price empty, per US-retry policy.
+      try {
+        if (this.isCurrentlyUnavailableNoAmazonPrice(result)) {
+          const keepa = await this.fetchKeepaFallback(asin, marketplace);
+          if (keepa) {
+            result.price = keepa.price;
+            result.priceText = keepa.priceText;
+            result.priceSource = 'keepa';
+            result.priceStatus = 'FALLBACK_KEEPa';
+            result.extractionStatus = 'UNAVAILABLE_ON_AMAZON_KEEPa_FALLBACK';
+            result.keepaNewPrice = keepa.price;
+            result.keepaNewPriceText = keepa.priceText;
+            result.keepaUrl = keepa.url;
+            result.keepaCheckedAt = now.toISOString();
+            const baseNote = result.offersCompletenessNote || result.extractionNote || result.pageStateReason || '';
+            const amazonMsg = result.availabilityMessage || result.availability || 'Currently unavailable';
+            const keepaNote = `Amazon on-site: ${amazonMsg}. No Amazon buybox price/offers shown. Keepa fallback (checked live): New ${keepa.priceText} (${keepa.url}).`;
+            result.extractionNote = baseNote && !/Keepa fallback/i.test(baseNote) ? `${baseNote} ${keepaNote}` : (baseNote || keepaNote);
+            if (result.availability == null) result.availability = 'Currently unavailable';
+          }
+        }
+      } catch {
+        // best-effort fallback
+      }
+
+      return result;
     },
       reusableContext,
     );
+  }
+
+
+  /**
+   * Best-effort Keepa fallback for cases where Amazon shows no current
+   * on-site price/stock (e.g. "Currently unavailable") but a market price
+   * exists on Keepa. Used only as fallback; never overrides a real Amazon
+   * on-site selling price.
+   */
+  private async fetchKeepaFallback(
+    asin: string,
+    marketplace: Marketplace,
+  ): Promise<{ price: number; priceText: string; url: string; currency?: string } | null> {
+    try {
+      // Keepa domain ids per Amazon marketplace (product URL: /product/{id}-{asin})
+      const keepaDomainId: Partial<Record<MarketplaceId, number>> = {
+        us: 1,
+        uk: 2,
+        de: 3,
+        ca: 6,
+        // Other supported marketplaces may have different/unsupported Keepa ids;
+        // avoid guessing wrong-market data.
+      };
+      const domainId = keepaDomainId[marketplace.id];
+      if (!domainId) return null;
+
+      const browser = await this.getBrowser();
+      const context = await browser.newContext({ locale: marketplace.locale || 'en-US' });
+      const page = await context.newPage();
+      try {
+        const url = `https://keepa.com/product/${domainId}-${asin}`;
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
+        await page.waitForTimeout(3000).catch(() => undefined);
+        const text = await page.evaluate(() => ((globalThis as any).document?.body?.innerText || '').replace(/\s+/g, ' ')).catch(() => '');
+        if (!text) return null;
+
+        const currencySymbol = (marketplace.currencySymbol || '$').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const currencyCode = (marketplace.currency || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const sym = `(?:${currencySymbol}|${currencyCode}|\\$|£|€|AED|SAR|EGP|CA\\$|CDN\\$)`;
+        const pick = (label: string) => {
+          const m = new RegExp(`\\b${label}:\\s*(${sym})?\\s*([0-9][0-9,]*(?:\\.[0-9]{1,2})?)`, 'i').exec(text);
+          if (!m?.[2]) return null;
+          const num = Number(m[2].replace(/,/g, ''));
+          if (!Number.isFinite(num)) return null;
+          const prefix = m[1] || marketplace.currencySymbol || '$';
+          return { price: num, priceText: `${prefix}${m[2]}`.replace(/\s+/g, '') };
+        };
+        const chosen = pick('New') || pick('Buy Box') || pick('Amazon');
+        if (!chosen) return null;
+        return { ...chosen, url, currency: marketplace.currency };
+      } finally {
+        await page.close().catch(() => undefined);
+        await context.close().catch(() => undefined);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  private productIndicatesOtherOffers(product: any, productHtml: string | null | undefined): boolean {
+    const blob = [
+      product?.availabilityMessage,
+      product?.buyingOptionsMessage,
+      product?.priceWarning,
+      ...(Array.isArray(product?.pageMessages) ? product.pageMessages : []),
+      typeof productHtml === 'string' ? productHtml.slice(0, 200000) : '',
+    ].filter(Boolean).join(' \n ');
+    return /New\s*\(\s*\d+\s*\)\s*from/i.test(blob)
+      || /Other sellers on Amazon/i.test(blob)
+      || /See [Aa]ll [Bb]uying [Oo]ptions/i.test(blob)
+      || /\/gp\/offer-listing\//i.test(blob)
+      || /#aod-offer|#aod-pinned-offer|#olp_feature_div|buybox-see-all-buying-choices|aod-ingress-link/i.test(blob)
+      || /\b\d+\s*(?:offers?|options?|other sellers?)\b/i.test(blob);
+  }
+
+  private isCurrentlyUnavailableNoAmazonPrice(product: any): boolean {
+    const availStatus = String(product?.availabilityStatus ?? '').toUpperCase();
+    const blob = `${product?.availability ?? ''} ${product?.availabilityMessage ?? ''} ${(Array.isArray(product?.pageMessages)?product.pageMessages.join(' '):'')}`.toLowerCase();
+    const unavailable = /UNAVAILABLE|OUT_OF_STOCK|NOT_AVAILABLE/.test(availStatus) || /currently unavailable|out of stock|unavailable/.test(blob);
+    const hasSellableAmazonPrice = (product?.price != null && Number.isFinite(Number(product.price))) || !!(product?.priceText && /\$|EGP|AED|SAR|£|€|\d/.test(String(product.priceText)));
+    const hasOffers = Array.isArray(product?.offers) && product.offers.length > 0;
+    return unavailable && !hasSellableAmazonPrice && !hasOffers;
   }
 
   /**
@@ -1254,21 +1476,96 @@ export class ScrapeWorker {
     options: ScrapeOptions = {},
   ): Promise<ScrapeResult<ProductWithOffers>> {
     const cached = fallback();
-    try {
-      const data = await this.scrapeProduct(asin, destination, marketplace, options);
-      return { data, fromCache: false, cacheAgeSeconds: null, staleReason: null };
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      if (cached) {
-        return {
-          data: cached,
-          fromCache: true,
-          cacheAgeSeconds: Math.round((Date.now() - Date.parse(cached.scrapedAt)) / 1000),
-          staleReason: reason,
-        };
+    const MAX_ATTEMPTS = 3;
+    let lastError: unknown = null;
+    let best: ProductWithOffers | null = null;
+
+    const sel = (options.selectedFields && options.selectedFields.length > 0) ? new Set(options.selectedFields) : null;
+    const wantF = (id: string) => sel === null || sel.has(id);
+    const wantAnyPriceF = wantF('price') || wantF('priceText') || wantF('buyBoxSellerPrice') || wantF('buyBoxTotal');
+    const wantAvailF = wantF('availability') || wantF('availabilityStatus') || wantF('availabilityMessage') || wantF('shippingMessage');
+    const wantTitleF = wantF('title') || wantF('titleEn');
+    const wantOtherSellersF = wantF('otherSellers');
+    const wantBuyBoxNameF = wantF('buyBoxSellerName');
+
+    const isHard404 = (p: ProductWithOffers | null): boolean => {
+      const blob = `${p?.pageState ?? ''} ${p?.pageStateReason ?? ''} ${p?.offersCompletenessNote ?? ''}`;
+      return /\bNOT_FOUND\b/i.test(String(p?.pageState ?? '')) || /\b404\b|page not found/i.test(blob);
+    };
+    const isClearlyUnavailable = (p: ProductWithOffers): boolean => {
+      if (p.selectionRequired === true) return false;
+      const availStatus = String((p as any).availabilityStatus ?? '').toUpperCase();
+      const blob = `${p.availability ?? ''} ${(p as any).availabilityMessage ?? ''} ${p.pageStateReason ?? ''}`.toLowerCase();
+      return /UNAVAILABLE|OUT_OF_STOCK|CANNOT_SHIP|NOT_AVAILABLE/.test(availStatus) ||
+        /currently unavailable|out of stock|cannot be shipped|not available to ship|unavailable/.test(blob);
+    };
+    const needsAnotherAttempt = (p: ProductWithOffers, attempt: number): boolean => {
+      if (isHard404(p)) return false;
+      const hasCore = !!(p.title || p.price != null || p.priceText || p.availability || p.brand || p.buyBoxSellerName || (p.offers?.length ?? 0) > 0);
+      if (sel === null) {
+        if (!hasCore) return true;
+        // If Amazon clearly states unavailable/no shippable offer, missing price/offers is often final.
+        if (isClearlyUnavailable(p) && hasCore) return false;
+        if (p.price == null && !p.priceText) return true;
+        if (!p.buyBoxSellerName && (p.offers?.length ?? 0) === 0) return true;
+        if ((p.offers?.length ?? 0) === 0) return true;
+        return false;
       }
-      throw error;
+      // Field-aware: retry only for requested data that looks recoverable/incomplete.
+      if ((wantTitleF || wantF('image') || wantF('url') || wantF('brand')) && !p.title && !p.url && !p.brand && attempt < MAX_ATTEMPTS) return true;
+      const unavailableFinal = isClearlyUnavailable(p) && hasCore;
+      if (wantAnyPriceF && p.price == null && !p.priceText && !unavailableFinal) return true;
+      if (wantBuyBoxNameF && !p.buyBoxSellerName && !unavailableFinal && attempt < MAX_ATTEMPTS) return true;
+      if (wantAvailF && !(p.availability || p.availabilityMessage || p.availabilityStatus) && attempt < MAX_ATTEMPTS) return true;
+      if (wantOtherSellersF && (p.offers?.length ?? 0) === 0 && !unavailableFinal && attempt < MAX_ATTEMPTS) return true;
+      return false;
+    };
+
+    const finalizeResult = (data: ProductWithOffers, errorMessage?: string | null) => {
+      annotateProductQuality(data, errorMessage ?? null);
+      if (shouldRecordCase(data, { confidence: data.confidence ?? 0, quality: (data.quality ?? 'low') as any, flags: data.qualityFlags ?? [] }, errorMessage ?? null)) {
+        (data as any).caseId = recordCase({ asin, marketplaceId: marketplace.id, product: data, errorMessage: errorMessage ?? null, note: 'scrapeWithFallback result' });
+      }
+      stripInternalEvidence(data);
+      return data;
+    };
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const data = await this.scrapeProduct(asin, destination, marketplace, options);
+        best = data;
+        if (!needsAnotherAttempt(data, attempt) || attempt === MAX_ATTEMPTS) {
+          return { data: finalizeResult(data), fromCache: false, cacheAgeSeconds: null, staleReason: null };
+        }
+        await new Promise((r) => setTimeout(r, 6000 * attempt));
+      } catch (error) {
+        lastError = error;
+        const reason = error instanceof Error ? error.message : String(error);
+        if (/captcha|403|429|503|paused|restricted/i.test(reason)) break;
+        if (attempt < MAX_ATTEMPTS) {
+          const fatal = /browser has been closed|Target .* closed|context.*closed|Protocol error|page\.content/i.test(reason);
+          await new Promise((r) => setTimeout(r, fatal ? 5000 : 10000 * attempt));
+          continue;
+        }
+      }
     }
+
+    if (best) {
+      return { data: finalizeResult(best), fromCache: false, cacheAgeSeconds: null, staleReason: null };
+    }
+
+    const reason = lastError instanceof Error ? lastError.message : String(lastError ?? 'Unknown error');
+    if (cached) {
+      return {
+        data: finalizeResult(cached, reason),
+        fromCache: true,
+        cacheAgeSeconds: Math.round((Date.now() - Date.parse(cached.scrapedAt)) / 1000),
+        staleReason: reason,
+      };
+    }
+    // No data at all: record a lightweight error case for learning/diagnosis.
+    recordCase({ asin, marketplaceId: marketplace.id, product: null, errorMessage: reason, note: 'scrapeWithFallback failed with no data' });
+    throw lastError instanceof Error ? lastError : new Error(reason);
   }
 }
 

@@ -341,6 +341,14 @@ function fulfillmentFromText(text: string): Fulfillment {
  * N% positive. Each part is extracted with its own pattern so a missing piece
  * degrades to `null` instead of corrupting its neighbours.
  */
+function cleanSellerName(value: string | null): string | null {
+  const name = clean(value);
+  if (!name) return null;
+  // AOD blurbs often read "... Sold by Homes Haven Seller rating is ..."; the
+  // word "Seller" is a label before rating, not part of the store name.
+  return clean(name.replace(/\s+Seller(?=\s*$)/i, ''));
+}
+
 function parseSellerBlock(text: string, href: string | undefined): {
   name: string | null;
   rating: number | null;
@@ -353,19 +361,19 @@ function parseSellerBlock(text: string, href: string | undefined): {
   // Prefer "Sold by X" over "Ships from X": the latter is fulfilment, not
   // ownership. Only fall back to "ships from" when no "sold by" is present.
   const soldByMatch =
-    /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by)\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:rated|rating|تقييم)\b|$)/i.exec(
+    /(?:sold\s+by|ships\s+from\s+and\s+sold\s+by)\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:Seller\s+rating\b|Seller\s+is\b|rated|rating|تقييم)\b|$)/i.exec(
       text,
     ) ??
     /(?:يُباع|يباع)\s+(?:من\s+)?([^،,()]+?)(?=\s*(?:تقييم|،|,)|$)/.exec(text) ??
     /(?:بائعه|بائعته)\s+([^،,()]+?)(?=\s*(?:تقييم|،|,)|$)/.exec(text);
 
-  const shipsFromMatch = /ships\s+from\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:rated|rating|تقييم)\b|$)/i.exec(
+  const shipsFromMatch = /ships\s+from\s+(?:by\s+)?([^,()]+?)(?=\s*(?:,\s*)?(?:Seller\s+rating\b|Seller\s+is\b|rated|rating|تقييم)\b|$)/i.exec(
     text,
   );
 
   const nameMatch = soldByMatch ?? shipsFromMatch;
 
-  const name = clean(nameMatch?.[1]?.replace(/\s+/g, ' '));
+  const name = cleanSellerName(nameMatch?.[1]?.replace(/\s+/g, ' ') ?? null);
 
   // Rating: "3.5 out of 5 stars" / "3.5 من أصل 5 نجوم".
   const ratingMatch =
@@ -696,32 +704,59 @@ export function parseOffers(
   for (const { element: group, pinned } of groups) {
     // A group is only a real offer if it names a seller. Price-only and
     // cart-only sections are skipped rather than becoming empty rows.
-    const sellerLink = group
+    const sellerLinkCandidates = group
       .find('a[href*="seller="]')
-      .filter((_i, el) => /[?&]seller=[A-Z0-9]{6,}/i.test($(el).attr('href') ?? ''))
-      .first();
+      .toArray()
+      .map((element) => $(element))
+      .filter((el) => /[?&]seller=[A-Z0-9]{6,}/i.test(el.attr('href') ?? ''))
+      // Shipping-rates / details links often carry `seller=` but are not the
+      // seller identity (e.g. Arabic "التفاصيل" details links).
+      .filter((el) => {
+        const href = el.attr('href') ?? '';
+        if (/\/gp\/aag\/details\//i.test(href)) return false;
+        if (/[?&]sshmPath=shipping-rates/i.test(href)) return false;
+        return true;
+      });
+
+    const badSellerLinkName = (value: string | null): boolean => {
+      const name = (value ?? '').replace(/\s+/g, ' ').trim();
+      if (!name) return true;
+      // UI control labels (not seller names) that can appear as link text in
+      // offer/delivery blocks across locales (e.g. Arabic "التفاصيل" = Details).
+      if (/^(details|detail|shipping rates?|learn more|store|visit the .*store)$/i.test(name)) return true;
+      if (/^(التفاصيل|تفاصيل|التفصيل|اعرف المزيد|معرفة المزيد|أسعار الشحن|المتجر|عرض المزيد|عرض أقل)$/u.test(name)) return true;
+      return false;
+    };
+
+    const profileSellerLink =
+      sellerLinkCandidates.find((el) => /\/gp\/aag\/main/i.test(el.attr('href') ?? '')) ??
+      sellerLinkCandidates.find((el) => !badSellerLinkName(clean(el.text()))) ??
+      sellerLinkCandidates[0];
+    const sellerLink = profileSellerLink;
 
     const soldByBlock = group.find('[id$="aod-offer-soldBy"]').first();
     const sellerBlockText = clean(soldByBlock.text()) ?? '';
     const blockText = sellerBlockText || clean(group.text()) || '';
 
-    const href = sellerLink.attr('href');
+    const href = sellerLink?.attr('href');
 
     // An offer can carry several `seller=` links (a shipping-rates link that
     // lacks the flag, then the profile link that has it). Scan all of them so
     // `isAmazonFulfilled` is not missed just because the first link was the
     // wrong one.
-    const sellerHrefs = group
-      .find('a[href*="seller="]')
-      .toArray()
-      .map((element) => $(element).attr('href') ?? '');
+    const sellerHrefs = sellerLinkCandidates.map((el) => el.attr('href') ?? '');
 
     const sellerId =
       sellerHrefs.map((candidate) => sellerIdFromHref(candidate)).find((id) => id !== null) ??
       sellerIdFromHref(href);
 
     const parsedSeller = parseSellerBlock(blockText, href);
-    const sellerName = parsedSeller.name ?? clean(sellerLink.text());
+    // Profile links usually carry the cleanest store name; sold-by blurbs can
+    // include rating-label noise (e.g. "Homes Haven Seller rating is...").
+    const linkName = sellerLinkCandidates
+      .map((el) => clean(el.text()))
+      .find((name) => !!name && !badSellerLinkName(name)) ?? null;
+    const sellerName = linkName || parsedSeller.name;
 
     // Nothing identifies this row — it is not an offer.
     if (!sellerName && !sellerId) continue;
@@ -733,7 +768,12 @@ export function parseOffers(
     // Scoped to the pinned block on purpose. Amazon genuinely sells on its own
     // marketplace, and that row carries a real price; applying this guard to
     // every row silently discarded the Amazon-as-seller offer along with it.
-    if (pinned && !sellerId && sellerName && /^amazon(\.[a-z.]+)?$/i.test(sellerName.trim())) {
+    if (
+      pinned &&
+      !sellerId &&
+      sellerName &&
+      /^amazon(?:\.(?:com|co\.uk|ca|de|eg|ae|sa))?$/i.test(sellerName.trim())
+    ) {
       // Drop only when Amazon is the fulfilment origin, not the named seller.
       const soldByAmazon = /(?:sold\s+by|ships\s+from(?:\s+and\s+sold\s+by)?|shipper\s*\/?\s*seller|seller|يُباع\s+من|يباع\s+من|بائعه)\s+(?:by\s+)?amazon/i.test(
         blockText,

@@ -1,6 +1,6 @@
 {
   "name": "scraper-tool",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Scraper Tool \u2014 self-hosted Amazon.eg seller & delivery intelligence with single-ASIN search and bulk ASIN batch scraping",
   "type": "module",
   "main": "dist/server.js",
