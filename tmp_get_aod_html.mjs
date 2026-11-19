@@ -1,0 +1,13 @@
+import { chromium } from 'playwright';
+import fs from 'fs';
+const asin = process.argv[2] || 'B0000532A2';
+const browser = await chromium.launch({ headless: true });
+const context = await browser.newContext({ locale: 'en-US', timezoneId: 'America/New_York' });
+const page = await context.newPage();
+await page.goto(`https://www.amazon.com/gp/offer-listing/${asin}/ref=dp_olp_ALL_mbc?ie=UTF8&condition=ALL`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+await page.waitForTimeout(3500);
+const html = await page.content();
+fs.mkdirSync('/tmp/opencode', { recursive: true });
+fs.writeFileSync(`/tmp/opencode/aod-${asin}.html`, html);
+console.log(JSON.stringify({url: page.url(), len: html.length, saved: `/tmp/opencode/aod-${asin}.html`}));
+await browser.close();

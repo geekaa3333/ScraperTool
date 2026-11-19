@@ -31,6 +31,7 @@ import { archiveJobReports } from './reports.js';
 import { getMarketplace, type MarketplaceId } from './marketplaces.js';
 import { destinationForMarketplace } from './worker.js';
 import { buildExportRows } from './exports.js';
+import { annotateProductQuality, recordCase, shouldRecordCase, stripInternalEvidence } from './diagnostics.js';
 
 /** The slice of the scraper this worker needs, so tests can supply a double. */
 export interface WorkerScraper {
@@ -304,6 +305,28 @@ export class DurableJobWorker {
       `(owner ${job.userId})`,
     );
 
+    // Resolve selected fields from the job contract when available (durable + local stores).
+    // This ensures the worker only scrapes/retries requested data for fast, minimal jobs.
+    let jobSelectedFields: string[] | null = (job as any).selectedFields ?? null;
+    try {
+      const s: any = this.store as any;
+      if ((!jobSelectedFields || jobSelectedFields.length === 0) && typeof s.getBulkJob === 'function') {
+        const j = s.getBulkJob(job.jobId);
+        if (j && Array.isArray(j.selectedFields) && j.selectedFields.length > 0) jobSelectedFields = j.selectedFields;
+      }
+      if ((!jobSelectedFields || jobSelectedFields.length === 0) && typeof s.getJob === 'function') {
+        const j = await s.getJob(job.userId, job.jobId);
+        if (j && Array.isArray((j as any).selectedFields) && (j as any).selectedFields.length > 0) {
+          jobSelectedFields = (j as any).selectedFields;
+        }
+      }
+    } catch {
+      /* best effort; falls back to full scrape for compatibility */
+    }
+    if (jobSelectedFields && jobSelectedFields.length > 0) {
+      this.logger.log(`[worker] job ${job.jobId} using selected fields (${jobSelectedFields.length})`);
+    }
+
     try {
       for (;;) {
         if (this.stopping || this.cancelled.has(job.jobId)) break;
@@ -345,7 +368,7 @@ export class DurableJobWorker {
         // No item means the queue is drained for this job.
         if (!item) break;
 
-        await this.processItem(job, item, startedAt);
+        await this.processItem(job, item, startedAt, jobSelectedFields);
       }
 
       if (this.stopping) return;
@@ -376,79 +399,148 @@ export class DurableJobWorker {
     job: ClaimableJob,
     item: { marketplaceId: string; asin: string },
     startedAt: number,
+    selectedFields: string[] | null | undefined,
   ): Promise<void> {
     const marketplace = getMarketplace(item.marketplaceId as MarketplaceId);
-    // Resolved per item, never once per job: a mixed batch must never apply one
-    // marketplace's destination to another's rows.
     const destination = destinationForMarketplace(marketplace, job.destinationId);
 
-    try {
-      const context = await this.contextFor(marketplace);
-      const product = await this.scraper.scrapeProduct(item.asin, destination, marketplace, {}, context ?? undefined);
+    const sel = (selectedFields && selectedFields.length > 0) ? new Set(selectedFields) : null;
+    const wantF = (id: string) => sel === null || sel.has(id);
+    const wantBuyBoxPriceF = wantF('buyBoxSellerPrice') || wantF('buyBoxTotal');
+    const wantAnyPriceF = wantF('price') || wantF('priceText') || wantBuyBoxPriceF;
+    const wantAvailF = wantF('availability') || wantF('availabilityStatus') || wantF('availabilityMessage') || wantF('shippingMessage');
+    const wantTitleF = wantF('title') || wantF('titleEn');
+    const wantOtherSellersF = wantF('otherSellers');
+    const wantBuyBoxNameF = wantF('buyBoxSellerName');
 
-      // Persist before acknowledging the item. If the worker dies between these
-      // two steps the item is retried and the idempotent save replaces the
-      // snapshot instead of duplicating it.
-      await this.store.saveResult(job.userId, job.jobId, product, product.offers as never[]);
+    const MAX_ATTEMPTS = 3;
+    let finalProduct: Record<string, unknown> | null = null;
+    let finalError: unknown = null;
 
-      // Each explored variation is saved as its OWN row, keyed on its own ASIN.
-      //
-      // They are deliberately not folded into the parent: merging would file a
-      // child's sellers and price under the parent, which is how a report ends
-      // up claiming one price for a product whose sizes all differ. `saveResult`
-      // is idempotent per (job, marketplace, asin), so a retried item replaces
-      // these rows instead of accumulating them.
-      const variationRows = (product.variationSnapshots ?? []) as unknown as Array<Record<string, unknown>>;
-      for (const variation of variationRows) {
-        await this.store.saveResult(
-          job.userId,
-          job.jobId,
-          variation,
-          ((variation.offers ?? []) as unknown[]) as never[],
-        );
+    const isHard404 = (p: any, reason?: string | null): boolean => {
+      const blob = `${p?.pageState ?? ''} ${p?.pageStateReason ?? ''} ${p?.offersCompletenessNote ?? ''} ${reason ?? ''}`;
+      return /\bNOT_FOUND\b/i.test(String(p?.pageState ?? '')) || /\b404\b|page not found|page doesn'?t exist/i.test(blob);
+    };
+    const isClearlyUnavailable = (p: any): boolean => {
+      if (p?.selectionRequired === true) return false;
+      const availStatus = String(p?.availabilityStatus ?? '').toUpperCase();
+      const blob = `${p?.availability ?? ''} ${p?.availabilityMessage ?? ''} ${p?.pageStateReason ?? ''}`.toLowerCase();
+      return /UNAVAILABLE|OUT_OF_STOCK|CANNOT_SHIP|NOT_AVAILABLE/.test(availStatus) ||
+        /currently unavailable|out of stock|cannot be shipped|not available to ship|unavailable/.test(blob);
+    };
+    const needsAnotherAttempt = (p: any, attempt: number): boolean => {
+      if (isHard404(p)) return false;
+      const hasCore = !!(p?.title || p?.price != null || p?.priceText || p?.availability || p?.brand || p?.buyBoxSellerName || (p?.offers?.length ?? 0) > 0);
+      if (sel === null) {
+        if (!hasCore) return true;
+        if (isClearlyUnavailable(p) && hasCore) return false;
+        if (p?.price == null && !p?.priceText) return true;
+        if (!p?.buyBoxSellerName && (p?.offers?.length ?? 0) === 0) return true;
+        if ((p?.offers?.length ?? 0) === 0) return true;
+        return false;
       }
-      await this.store.completeItem(job.userId, job.jobId, item.marketplaceId, item.asin, 'DONE');
+      // Field-aware: retry only for requested data that looks recoverable/incomplete.
+      if ((wantTitleF || wantF('image') || wantF('url') || wantF('brand')) && !p?.title && !p?.url && !p?.brand && attempt < MAX_ATTEMPTS) return true;
+      const unavailableFinal = isClearlyUnavailable(p) && hasCore;
+      if (wantAnyPriceF && p?.price == null && !p?.priceText && !unavailableFinal) return true;
+      if (wantBuyBoxNameF && !p?.buyBoxSellerName && !unavailableFinal && attempt < MAX_ATTEMPTS) return true;
+      if (wantAvailF && !(p?.availability || p?.availabilityMessage || p?.availabilityStatus) && attempt < MAX_ATTEMPTS) return true;
+      if (wantOtherSellersF && (p?.offers?.length ?? 0) === 0 && !unavailableFinal && attempt < MAX_ATTEMPTS) return true;
+      return false;
+    };
 
-      const elapsed = Date.now() - startedAt;
-      await this.store.setJobProgress(job.userId, job.jobId, {
-        marketplaceId: item.marketplaceId,
-        asin: item.asin,
-        elapsedMs: elapsed,
-      });
-      this.emit({
-        type: 'item-done',
-        jobId: job.jobId,
-        marketplaceId: item.marketplaceId as MarketplaceId,
-        asin: item.asin,
-        elapsedMs: elapsed,
-      });
-    } catch (error) {
-      const message = String((error as Error)?.message ?? error).slice(0, 1000);
-      // A 404 is not a failure. Amazon confirmed the listing does not exist,
-      // which is a different fact from "we could not read the page", and History
-      // keeps them apart so a batch full of dead ASINs does not read as a run
-      // that fell over. Retrying a 404 would only re-ask for something already
-      // proven absent.
-      const notFound = /404|not found|not available|page doesn'?t exist/i.test(message);
-      await this.store.failItem(
-        job.userId,
-        job.jobId,
-        item.marketplaceId,
-        item.asin,
-        message,
-        notFound ? 'NOT_FOUND' : 'FAILED',
-      );
-      this.emit({
-        type: 'item-failed',
-        jobId: job.jobId,
-        marketplaceId: item.marketplaceId as MarketplaceId,
-        asin: item.asin,
-        reason: message,
-      });
-      this.logger.warn(
-        `[worker] item ${item.asin} (${item.marketplaceId}) ${notFound ? 'not found' : 'failed'}: ${message}`,
-      );
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        if (this.scraper.blockedForSeconds() > 0) {
+          throw new Error(this.scraper.blockReason ?? 'Amazon restricted automated access.');
+        }
+        const context = await this.contextFor(marketplace);
+        const product = await this.scraper.scrapeProduct(
+          item.asin,
+          destination,
+          marketplace,
+          selectedFields && selectedFields.length > 0 ? { selectedFields } : {},
+          context ?? undefined,
+        ) as any;
+        finalProduct = product;
+        finalError = null;
+
+        if (!needsAnotherAttempt(product, attempt) || attempt === MAX_ATTEMPTS) break;
+        await new Promise((r) => setTimeout(r, 6000 * attempt));
+      } catch (error) {
+        finalError = error;
+        finalProduct = null;
+        const message = String((error as Error)?.message ?? error);
+        if (isHard404(null, message) || /captcha|403|429|503|paused|restricted/i.test(message)) break;
+        if (attempt < MAX_ATTEMPTS) {
+          const fatal = /browser has been closed|Target .* closed|context.*closed|Protocol error|page\.content/i.test(message);
+          await new Promise((r) => setTimeout(r, fatal ? 5000 : 10000 * attempt));
+          continue;
+        }
+      }
     }
+
+    if (finalProduct) {
+      try {
+        annotateProductQuality(finalProduct as any);
+        if (shouldRecordCase(finalProduct as any, { confidence: (finalProduct as any).confidence ?? 0, quality: ((finalProduct as any).quality ?? 'low') as any, flags: (finalProduct as any).qualityFlags ?? [] })) {
+          (finalProduct as any).caseId = recordCase({ asin: item.asin, marketplaceId: item.marketplaceId, product: finalProduct as any, note: 'durable job-worker result' });
+        }
+        stripInternalEvidence(finalProduct as any);
+        await this.store.saveResult(job.userId, job.jobId, finalProduct, (finalProduct as any).offers as never[]);
+        const variationRows = ((finalProduct as any).variationSnapshots ?? []) as unknown as Array<Record<string, unknown>>;
+        for (const variation of variationRows) {
+          annotateProductQuality(variation as any);
+          await this.store.saveResult(
+            job.userId,
+            job.jobId,
+            variation,
+            ((variation.offers ?? []) as unknown[]) as never[],
+          );
+        }
+        await this.store.completeItem(job.userId, job.jobId, item.marketplaceId, item.asin, 'DONE');
+
+        const elapsed = Date.now() - startedAt;
+        await this.store.setJobProgress(job.userId, job.jobId, {
+          marketplaceId: item.marketplaceId,
+          asin: item.asin,
+          elapsedMs: elapsed,
+        });
+        this.emit({
+          type: 'item-done',
+          jobId: job.jobId,
+          marketplaceId: item.marketplaceId as MarketplaceId,
+          asin: item.asin,
+          elapsedMs: elapsed,
+        });
+        return;
+      } catch (error) {
+        finalError = error;
+        finalProduct = null;
+      }
+    }
+
+    const message = String((finalError as Error)?.message ?? finalError ?? 'Failed after retries').slice(0, 1000);
+    const notFound = isHard404(finalProduct as any, message);
+    recordCase({ asin: item.asin, marketplaceId: item.marketplaceId, product: null, errorMessage: message, note: 'durable job-worker failed' });
+    await this.store.failItem(
+      job.userId,
+      job.jobId,
+      item.marketplaceId,
+      item.asin,
+      message,
+      notFound ? 'NOT_FOUND' : 'FAILED',
+    );
+    this.emit({
+      type: 'item-failed',
+      jobId: job.jobId,
+      marketplaceId: item.marketplaceId as MarketplaceId,
+      asin: item.asin,
+      reason: message,
+    });
+    this.logger.warn(
+      `[worker] item ${item.asin} (${item.marketplaceId}) ${notFound ? 'not found' : 'failed'}: ${message}`,
+    );
   }
 
   /** Mark a drained job complete, refresh its counters, and archive reports. */

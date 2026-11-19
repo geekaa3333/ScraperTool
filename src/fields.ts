@@ -112,6 +112,10 @@ export const FIELDS: FieldDef[] = [
   { id: 'offersCount', label: 'Offers Found', group: 'Marketplace & Meta', header: 'Offers Found', width: 13, numeric: true, rowKey: 'offersCount' },
   { id: 'offersComplete', label: 'Offers Complete', group: 'Marketplace & Meta', header: 'Offers Complete', width: 15, rowKey: 'offersComplete' },
   { id: 'scrapedAt', label: 'Retrieved At (UTC)', group: 'Marketplace & Meta', header: 'Retrieved At (UTC)', width: 22, rowKey: 'scrapedAt' },
+  { id: 'confidence', label: 'Confidence (0-1)', group: 'Marketplace & Meta', header: 'Confidence', width: 12, numeric: true, rowKey: 'confidence' },
+  { id: 'quality', label: 'Quality', group: 'Marketplace & Meta', header: 'Quality', width: 12, rowKey: 'quality' },
+  { id: 'qualityFlags', label: 'Quality Flags', group: 'Marketplace & Meta', header: 'Quality Flags', width: 40, rowKey: 'qualityFlags' },
+  { id: 'caseId', label: 'Case ID', group: 'Marketplace & Meta', header: 'Case ID', width: 38, rowKey: 'caseId' },
 ];
 
 export const DEFAULT_FIELDS: string[] = FIELDS.map((f) => f.id);
@@ -119,6 +123,8 @@ export const DEFAULT_FIELDS: string[] = FIELDS.map((f) => f.id);
 export const PRESETS: Record<string, string[]> = {
   basic: ['asin', 'title', 'image', 'url'],
   buybox: ['asin', 'title', 'image', 'url', 'buyBoxSellerName', 'buyBoxSellerPrice', 'isBuyBox'],
+  /** Fast preset for urgent minimal jobs: ASIN + displayed/buy-box price + product link. */
+  quick: ['asin', 'url', 'priceText', 'price', 'buyBoxSellerPrice'],
   full: DEFAULT_FIELDS,
 };
 

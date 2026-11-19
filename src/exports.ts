@@ -275,6 +275,10 @@ const BASE_COLUMNS: Column[] = [
   { key: 'status', header: 'Status', width: 14 },
   { key: 'statusDetail', header: 'Status Detail', width: 44 },
   { key: 'scrapedAt', header: 'Retrieved At (UTC)', width: 22 },
+  { key: 'confidence', header: 'Confidence', width: 12, numeric: true },
+  { key: 'quality', header: 'Quality', width: 12 },
+  { key: 'qualityFlags', header: 'Quality Flags', width: 40 },
+  { key: 'caseId', header: 'Case ID', width: 38 },
 ];
 
 /**
@@ -336,13 +340,19 @@ for (const f of [
   { id: 'offersCount', key: 'offersCount' },
   { id: 'offersComplete', key: 'offersComplete' },
   { id: 'scrapedAt', key: 'scrapedAt' },
+  { id: 'confidence', key: 'confidence' },
+  { id: 'quality', key: 'quality' },
+  { id: 'qualityFlags', key: 'qualityFlags' },
+  { id: 'caseId', key: 'caseId' },
 ]) {
   COLUMN_FIELD[f.key] = f.id;
 }
 
 /**
  * Resolve the active column set for a given selection. When `selected` is null
- * or empty, every column is kept (backward compat).
+ * or empty, every column is kept (backward compat). When specific fields are
+ * selected, only the columns mapped to those fields are emitted so exports/copy
+ * contain exactly what was requested.
  */
 export function activeColumns(selected: string[] | null | undefined, maxOtherSellers?: number | null): Column[] {
   if (!selected || selected.length === 0) selected = null;
@@ -361,9 +371,9 @@ export function activeColumns(selected: string[] | null | undefined, maxOtherSel
       }
       return true;
     }
+    if (set === null) return true; // no selection = all columns (backward compat)
     const fieldId = COLUMN_FIELD[key];
-    if (!fieldId) return true; // unknown columns are kept
-    if (set === null) return true;
+    if (!fieldId) return false; // with an explicit selection, exclude unmapped/meta columns
     return set.has(fieldId);
   });
 }
@@ -498,6 +508,10 @@ export function rowsForProduct(product: ProductWithOffers, maxOtherSellers?: num
     offersComplete: product.offersComplete,
     selectedFields: product.selectedFields ?? null,
     scrapedAt: product.scrapedAt,
+    confidence: (product as any).confidence ?? null,
+    quality: (product as any).quality ?? null,
+    qualityFlags: Array.isArray((product as any).qualityFlags) ? (product as any).qualityFlags.join('|') : ((product as any).qualityFlags ?? null),
+    caseId: (product as any).caseId ?? null,
     detectionMethod: product.provenance?.detectionMethod ?? 'single-marketplace',
     detectionStatus: product.provenance?.detectionStatus ?? 'PROVIDED',
     verificationResult: describeVerification(
@@ -787,6 +801,10 @@ export function failedRow(
     status,
     statusDetail: detail,
     scrapedAt: new Date().toISOString(),
+    confidence: null,
+    quality: status === 'NOT_FOUND' ? 'not_found' : null,
+    qualityFlags: null,
+    caseId: null,
   };
 }
 

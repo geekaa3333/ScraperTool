@@ -382,6 +382,14 @@ export interface ProductWithOffers extends ProductDetail {
    * an export reader can distinguish a stated region from a verified one.
    */
   provenance: MarketplaceProvenance | null;
+  /** Quality/confidence assessment of this extraction (best-effort). */
+  confidence?: number | null;
+  /** High-level quality label derived from confidence and page/result state. */
+  quality?: 'high' | 'medium' | 'low' | 'not_found' | null;
+  /** Machine-readable flags explaining missing/uncertain/requested-field issues. */
+  qualityFlags?: string[];
+  /** Case-memory/evidence id when this result was recorded for review. */
+  caseId?: string | null;
 }
 
 /** Result envelope so the UI can distinguish fresh data from a cache hit. */

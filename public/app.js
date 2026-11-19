@@ -473,6 +473,10 @@ function exportOffers(format) {
   if (!product) return;
   const params = new URLSearchParams({ asin: product.asin });
   if (state.destination?.id) params.set('destination', state.destination.id);
+  const sf = (typeof getSelectedFields === 'function') ? getSelectedFields() : null;
+  if (sf && sf.length > 0) params.set('fields', sf.join(','));
+  const maxOS = (typeof getMaxOtherSellers === 'function') ? getMaxOtherSellers() : (parseInt(localStorage.getItem('scraper.maxOtherSellers') || '0', 10) || 0);
+  if (maxOS > 0) params.set('maxOtherSellers', String(maxOS));
   window.location.href = `/api/export?${params}`;
   void format;
 }
@@ -1721,6 +1725,8 @@ function downloadExport(format) {
   const sf = (typeof getSelectedFields === 'function') ? getSelectedFields() : null;
   const url = new URL(`/api/bulk/jobs/${bulk.jobId}/export.${format}`, window.location.origin);
   if (sf && sf.length > 0) url.searchParams.set('fields', sf.join(','));
+  const maxOS = (typeof getMaxOtherSellers === 'function') ? getMaxOtherSellers() : (parseInt(localStorage.getItem('scraper.maxOtherSellers') || '0', 10) || 0);
+  if (maxOS > 0) url.searchParams.set('maxOtherSellers', String(maxOS));
   window.location.href = url.toString();
   void ext;
 }
@@ -1729,16 +1735,22 @@ function downloadExport(format) {
  * Copy the whole dataset to the clipboard as TSV.
  *
  * The text is fetched fresh from the same endpoint the download uses, so the
- * clipboard always holds every record — not just the visible page.
+ * clipboard holds every record (not just the visible page) — limited to the
+ * fields the user selected, so it matches the requested output.
  */
 async function copyAllResults() {
   if (!bulk.jobId) return;
   const button = $b('bulkCopy');
   busy(button, true, 'Copying…');
   try {
-    const tsv = await (await fetch(`/api/bulk/jobs/${bulk.jobId}/export.tsv`)).text();
+    const sf = (typeof getSelectedFields === 'function') ? getSelectedFields() : null;
+    const url = new URL(`/api/bulk/jobs/${bulk.jobId}/export.tsv`, window.location.origin);
+    if (sf && sf.length > 0) url.searchParams.set('fields', sf.join(','));
+    const maxOS = (typeof getMaxOtherSellers === 'function') ? getMaxOtherSellers() : (parseInt(localStorage.getItem('scraper.maxOtherSellers') || '0', 10) || 0);
+    if (maxOS > 0) url.searchParams.set('maxOtherSellers', String(maxOS));
+    const tsv = await (await fetch(url.toString())).text();
     await navigator.clipboard.writeText(tsv);
-    banner('info', 'Copied to clipboard.', 'Paste directly into Excel or Google Sheets — columns align automatically.');
+    banner('info', 'Copied to clipboard.', 'Paste directly into Excel or Google Sheets — columns align automatically (selected fields only).');
   } catch (error) {
     banner('error', 'Copy failed', error.message);
   } finally {
@@ -1783,7 +1795,8 @@ async function initFieldSelection() {
     document.querySelectorAll('[data-preset]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const preset = btn.dataset.preset;
-        if (preset === 'basic') selectedFields = new Set(presets.basic ?? []);
+        if (preset === 'quick') selectedFields = new Set(presets.quick ?? ['asin', 'url', 'priceText', 'price', 'buyBoxSellerPrice']);
+        else if (preset === 'basic') selectedFields = new Set(presets.basic ?? []);
         else if (preset === 'buybox') selectedFields = new Set(presets.buybox ?? []);
         else if (preset === 'full') selectedFields = new Set(presets.full ?? defaults);
         saveFieldSelection();
@@ -1800,7 +1813,9 @@ async function initFieldSelection() {
     });
 
     $('clearAllFields')?.addEventListener('click', () => {
-      selectedFields = new Set();
+      // Reset to a fast minimal baseline (avoid accidental "all fields" / empty selection).
+      const minimal = presets.quick ?? ['asin', 'url', 'priceText', 'price', 'buyBoxSellerPrice'];
+      selectedFields = new Set(minimal);
       saveFieldSelection();
       renderFieldChecklist();
       updateFieldCount();

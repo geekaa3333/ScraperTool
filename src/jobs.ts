@@ -11,6 +11,7 @@ import {
 } from './marketplaces.js';
 import { rowsForProduct, failedRow, type ExportRow } from './exports.js';
 import { record as recordTiming } from './timing.js';
+import { annotateProductQuality, recordCase, shouldRecordCase, stripInternalEvidence } from './diagnostics.js';
 
 /**
  * Bulk batch runner.
@@ -361,56 +362,134 @@ export class BulkRunner {
       const destination = destinationForMarketplace(marketplace, job.destinationId);
       control.currentCheck = { asin: item.asin, marketplaceId: item.marketplaceId };
 
-      try {
-        // The identical code path the single-ASIN search uses.
-        const product: ProductWithOffers = await this.worker.scrapeProduct(
-          item.asin,
-          destination,
-          marketplace,
-          {
-            detectionMethod: item.detectionMethod,
-            detectionStatus: item.detectionStatus as DetectionStatus,
-            originalInput: item.originalInput,
-            sourceRow: item.rowNumber,
-            sourceFile: item.sourceFile,
-            selectedFields: job.selectedFields ?? undefined,
-          },
-          await this.contextFor(item.marketplaceId, lane),
-        );
+      const MAX_ITEM_ATTEMPTS = 3;
+      let finalProduct: ProductWithOffers | null = null;
+      let finalReason: string | null = null;
+      let shouldStopBatch = false;
 
-        control.currentCheck = null;
+      const sel = (job.selectedFields && job.selectedFields.length > 0) ? new Set(job.selectedFields) : null;
+      const wantF = (id: string) => sel === null || sel.has(id);
+      const wantOffersF = wantF('otherSellers') || wantF('buyBoxSellerName') || wantF('buyBoxSellerPrice') || wantF('buyBoxSellerId') || wantF('isBuyBox') || wantF('buyBoxShipping') || wantF('buyBoxTotal') || wantF('buyBoxRating') || wantF('buyBoxFeedback') || wantF('buyBoxFulfillment') || wantF('buyBoxCondition') || wantF('buyBoxStock');
+      const wantBuyBoxPriceF = wantF('buyBoxSellerPrice') || wantF('buyBoxTotal');
+      const wantAnyPriceF = wantF('price') || wantF('priceText') || wantBuyBoxPriceF;
+      const wantAvailF = wantF('availability') || wantF('availabilityStatus') || wantF('availabilityMessage') || wantF('shippingMessage');
+      const wantTitleF = wantF('title') || wantF('titleEn');
+      const wantOtherSellersF = wantF('otherSellers');
+
+      const isHard404 = (p: ProductWithOffers | null, reason?: string | null): boolean => {
+        const blob = `${p?.pageState ?? ''} ${p?.pageStateReason ?? ''} ${p?.offersCompletenessNote ?? ''} ${reason ?? ''}`;
+        return /\bNOT_FOUND\b/i.test(String(p?.pageState ?? '')) || /\b404\b|page not found/i.test(blob);
+      };
+      const isClearlyUnavailable = (p: ProductWithOffers): boolean => {
+        if ((p as any).selectionRequired === true) return false;
+        const availStatus = String((p as any).availabilityStatus ?? '').toUpperCase();
+        const blob = `${p.availability ?? ''} ${(p as any).availabilityMessage ?? ''} ${p.pageStateReason ?? ''}`.toLowerCase();
+        return /UNAVAILABLE|OUT_OF_STOCK|CANNOT_SHIP|NOT_AVAILABLE/.test(availStatus) ||
+          /currently unavailable|out of stock|cannot be shipped|not available to ship|unavailable/.test(blob);
+      };
+      const needsAnotherAttempt = (p: ProductWithOffers, attempt: number): boolean => {
+        if (isHard404(p)) return false;
+        const hasCore = !!(p.title || p.price != null || p.priceText || p.availability || p.brand || p.buyBoxSellerName || (p.offers?.length ?? 0) > 0);
+        if (sel === null) {
+          if (!hasCore) return true;
+          if (isClearlyUnavailable(p) && hasCore) return false;
+          if (p.price == null && !p.priceText) return true;
+          if (!p.buyBoxSellerName && (p.offers?.length ?? 0) === 0) return true;
+          if ((p.offers?.length ?? 0) === 0) return true;
+          return false;
+        }
+        // Field-aware: retry only for requested data that looks recoverable/incomplete.
+        if ((wantTitleF || wantF('image') || wantF('url') || wantF('brand')) && !p.title && !p.url && !p.brand && attempt < MAX_ITEM_ATTEMPTS) return true;
+        const unavailableFinal = isClearlyUnavailable(p) && hasCore;
+        if (wantAnyPriceF && p.price == null && !p.priceText && !unavailableFinal) return true;
+        if (wantF('buyBoxSellerName') && !p.buyBoxSellerName && !unavailableFinal && attempt < MAX_ITEM_ATTEMPTS) return true;
+        if (wantBuyBoxPriceF && p.price == null && !p.buyBoxSellerName && !unavailableFinal && attempt < MAX_ITEM_ATTEMPTS) return true;
+        if (wantAvailF && !(p.availability || p.availabilityMessage || p.availabilityStatus) && attempt < MAX_ITEM_ATTEMPTS) return true;
+        if (wantOtherSellersF && (p.offers?.length ?? 0) === 0 && !unavailableFinal && attempt < MAX_ITEM_ATTEMPTS) return true;
+        return false;
+      };
+
+      for (let attempt = 1; attempt <= MAX_ITEM_ATTEMPTS; attempt++) {
+        try {
+          if (this.worker.blockedForSeconds() > 0) {
+            shouldStopBatch = true;
+            finalReason = this.worker.blockReason ?? 'Amazon restricted automated access.';
+            break;
+          }
+          const product: ProductWithOffers = await this.worker.scrapeProduct(
+            item.asin,
+            destination,
+            marketplace,
+            {
+              detectionMethod: item.detectionMethod,
+              detectionStatus: item.detectionStatus as DetectionStatus,
+              originalInput: item.originalInput,
+              sourceRow: item.rowNumber,
+              sourceFile: item.sourceFile,
+              selectedFields: job.selectedFields ?? undefined,
+            },
+            await this.contextFor(item.marketplaceId, lane),
+          );
+
+          finalProduct = product;
+          finalReason = null;
+
+          if (!needsAnotherAttempt(product, attempt) || attempt === MAX_ITEM_ATTEMPTS) {
+            break;
+          }
+          // Incomplete but recoverable — retry to find missing details.
+          await new Promise((r) => setTimeout(r, 6000 * attempt));
+          continue;
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          finalReason = reason;
+          finalProduct = null;
+
+          if (
+            /captcha|403|429|503|paused|restricted/i.test(reason) ||
+            /timed out/i.test(reason)
+          ) {
+            shouldStopBatch = true;
+            break;
+          }
+
+          if (attempt < MAX_ITEM_ATTEMPTS) {
+            const fatal = /browser has been closed|Target .* closed|context.*closed|Protocol error|page\.content/i.test(reason);
+            await new Promise((r) => setTimeout(r, fatal ? 5000 : 10000 * attempt));
+            continue;
+          }
+        }
+      }
+
+      control.currentCheck = null;
+
+      if (shouldStopBatch) {
+        if (!stopped.value) {
+          stopped.value = true;
+          this.store.resetStuckBulkItems(jobId);
+          this.dropAllContexts();
+          this.store.setBulkJobStatus(jobId, 'paused', {
+            pausedReason: `${finalReason ?? 'Restricted'} — processing paused to respect Amazon's restriction.`,
+          });
+          this.scheduleAutoResume(jobId);
+        }
+        return;
+      }
+
+      if (finalProduct) {
+        annotateProductQuality(finalProduct);
+        if (shouldRecordCase(finalProduct, { confidence: finalProduct.confidence ?? 0, quality: (finalProduct.quality ?? 'low') as any, flags: finalProduct.qualityFlags ?? [] })) {
+          (finalProduct as any).caseId = recordCase({ asin: item.asin, marketplaceId: item.marketplaceId, product: finalProduct, note: 'bulk workerLane result' });
+        }
+        stripInternalEvidence(finalProduct as any);
         const saveStarted = process.hrtime.bigint();
-        this.store.completeBulkItem(jobId, product);
-        // Persist into the main history tables too, so bulk results share the
-        // same marketplace-scoped cache the manual search reads.
-        this.store.save(product);
+        this.store.completeBulkItem(jobId, finalProduct);
+        this.store.save(finalProduct);
         recordTiming('save', Number(process.hrtime.bigint() - saveStarted) / 1e6);
         this.recordCompletion(jobId);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        control.currentCheck = null;
-
-        // A restriction OR a hung request (timeout) is a stop condition for the
-        // whole batch: continuing would hammer Amazon while it is refusing us,
-        // or stall forever on a connection that never resolves. The claimed
-        // items return to the queue instead of being burned.
-        if (
-          /captcha|403|429|503|paused|restricted/i.test(reason) ||
-          /timed out/i.test(reason)
-        ) {
-          if (!stopped.value) {
-            stopped.value = true;
-            this.store.resetStuckBulkItems(jobId);
-            this.dropAllContexts();
-            this.store.setBulkJobStatus(jobId, 'paused', {
-              pausedReason: `${reason} — processing paused to respect Amazon's restriction.`,
-            });
-            this.scheduleAutoResume(jobId);
-          }
-          return;
-        }
-
-        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, reason);
+      } else {
+        recordCase({ asin: item.asin, marketplaceId: item.marketplaceId, product: null, errorMessage: finalReason ?? 'Failed after retries', note: 'bulk workerLane failed' });
+        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, finalReason ?? 'Failed after retries');
         this.recordCompletion(jobId);
       }
     }
@@ -543,33 +622,108 @@ export class BulkRunner {
       const destination = destinationForMarketplace(marketplace, this.store.getBulkJob(jobId)?.destinationId ?? null);
       control.currentCheck = { asin: item.asin, marketplaceId: item.marketplaceId };
 
-      try {
-        const product = await this.worker.scrapeProduct(item.asin, destination, marketplace, {
-          detectionMethod: item.detectionMethod,
-          detectionStatus: item.detectionStatus as DetectionStatus,
-          originalInput: item.originalInput,
-          sourceRow: item.rowNumber,
-          sourceFile: item.sourceFile,
-          selectedFields: this.store.getBulkJob(jobId)?.selectedFields ?? undefined,
-        }, await this.contextFor(item.marketplaceId));
-        control.currentCheck = null;
-        this.store.completeBulkItem(jobId, product);
-        this.store.save(product);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        control.currentCheck = null;
-        // Restrictions pause the batch with the claimed item re-queued, not
-        // burned — the loop path documents the same reasoning.
-        if (/captcha|403|429|503|paused|restricted/i.test(reason)) {
-          this.store.resetStuckBulkItems(jobId);
-          this.dropAllContexts();
-          this.store.setBulkJobStatus(jobId, 'paused', {
-            pausedReason: `${reason} — processing paused.`,
-          });
-          this.scheduleAutoResume(jobId);
-          return;
+      const MAX_ITEM_ATTEMPTS = 3;
+      let finalProduct: ProductWithOffers | null = null;
+      let finalReason: string | null = null;
+      let shouldStopBatch = false;
+
+      const isHard404 = (p: ProductWithOffers | null, reason?: string | null): boolean => {
+        const blob = `${p?.pageState ?? ''} ${p?.pageStateReason ?? ''} ${p?.offersCompletenessNote ?? ''} ${reason ?? ''}`;
+        return /\bNOT_FOUND\b/i.test(String(p?.pageState ?? '')) || /\b404\b|page not found/i.test(blob);
+      };
+      const isClearlyUnavailable = (p: ProductWithOffers): boolean => {
+        if ((p as any).selectionRequired === true) return false;
+        const availStatus = String((p as any).availabilityStatus ?? '').toUpperCase();
+        const blob = `${p.availability ?? ''} ${(p as any).availabilityMessage ?? ''} ${p.pageStateReason ?? ''}`.toLowerCase();
+        return /UNAVAILABLE|OUT_OF_STOCK|CANNOT_SHIP|NOT_AVAILABLE/.test(availStatus) ||
+          /currently unavailable|out of stock|cannot be shipped|not available to ship|unavailable/.test(blob);
+      };
+
+      const selectedFields = this.store.getBulkJob(jobId)?.selectedFields ?? undefined;
+      const sel2 = (selectedFields && selectedFields.length > 0) ? new Set(selectedFields) : null;
+      const wantF2 = (id: string) => sel2 === null || sel2.has(id);
+      const wantBuyBoxPriceF2 = wantF2('buyBoxSellerPrice') || wantF2('buyBoxTotal');
+      const wantAnyPriceF2 = wantF2('price') || wantF2('priceText') || wantBuyBoxPriceF2;
+      const wantAvailF2 = wantF2('availability') || wantF2('availabilityStatus') || wantF2('availabilityMessage') || wantF2('shippingMessage');
+      const wantTitleF2 = wantF2('title') || wantF2('titleEn');
+      const wantOtherSellersF2 = wantF2('otherSellers');
+      const needsAnotherAttempt2 = (p: ProductWithOffers, attempt: number): boolean => {
+        if (isHard404(p)) return false;
+        const hasCore = !!(p.title || p.price != null || p.priceText || p.availability || p.brand || p.buyBoxSellerName || (p.offers?.length ?? 0) > 0);
+        if (sel2 === null) {
+          if (!hasCore) return true;
+          if (isClearlyUnavailable(p) && hasCore) return false;
+          if (p.price == null && !p.priceText) return true;
+          if (!p.buyBoxSellerName && (p.offers?.length ?? 0) === 0) return true;
+          if ((p.offers?.length ?? 0) === 0) return true;
+          return false;
         }
-        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, reason);
+        if ((wantTitleF2 || wantF2('image') || wantF2('url') || wantF2('brand')) && !p.title && !p.url && !p.brand && attempt < MAX_ITEM_ATTEMPTS) return true;
+        const unavailableFinal = isClearlyUnavailable(p) && hasCore;
+        if (wantAnyPriceF2 && p.price == null && !p.priceText && !unavailableFinal) return true;
+        if (wantF2('buyBoxSellerName') && !p.buyBoxSellerName && !unavailableFinal && attempt < MAX_ITEM_ATTEMPTS) return true;
+        if (wantBuyBoxPriceF2 && p.price == null && !p.buyBoxSellerName && !unavailableFinal && attempt < MAX_ITEM_ATTEMPTS) return true;
+        if (wantAvailF2 && !(p.availability || p.availabilityMessage || p.availabilityStatus) && attempt < MAX_ITEM_ATTEMPTS) return true;
+        if (wantOtherSellersF2 && (p.offers?.length ?? 0) === 0 && !unavailableFinal && attempt < MAX_ITEM_ATTEMPTS) return true;
+        return false;
+      };
+
+      for (let attempt = 1; attempt <= MAX_ITEM_ATTEMPTS; attempt++) {
+        try {
+          if (this.worker.blockedForSeconds() > 0) {
+            shouldStopBatch = true;
+            finalReason = this.worker.blockReason ?? 'Amazon restricted automated access.';
+            break;
+          }
+          const product = await this.worker.scrapeProduct(item.asin, destination, marketplace, {
+            detectionMethod: item.detectionMethod,
+            detectionStatus: item.detectionStatus as DetectionStatus,
+            originalInput: item.originalInput,
+            sourceRow: item.rowNumber,
+            sourceFile: item.sourceFile,
+            selectedFields,
+          }, await this.contextFor(item.marketplaceId));
+          finalProduct = product;
+          finalReason = null;
+          if (!needsAnotherAttempt2(product, attempt) || attempt === MAX_ITEM_ATTEMPTS) break;
+          await new Promise((r) => setTimeout(r, 6000 * attempt));
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          finalReason = reason;
+          finalProduct = null;
+          if (/captcha|403|429|503|paused|restricted/i.test(reason) || /timed out/i.test(reason)) {
+            shouldStopBatch = true;
+            break;
+          }
+          if (attempt < MAX_ITEM_ATTEMPTS) {
+            const fatal = /browser has been closed|Target .* closed|context.*closed|Protocol error|page\.content/i.test(reason);
+            await new Promise((r) => setTimeout(r, fatal ? 5000 : 10000 * attempt));
+            continue;
+          }
+        }
+      }
+
+      control.currentCheck = null;
+      if (shouldStopBatch) {
+        this.store.resetStuckBulkItems(jobId);
+        this.dropAllContexts();
+        this.store.setBulkJobStatus(jobId, 'paused', {
+          pausedReason: `${finalReason ?? 'Restricted'} — processing paused.`,
+        });
+        this.scheduleAutoResume(jobId);
+        return;
+      }
+      if (finalProduct) {
+        annotateProductQuality(finalProduct);
+        if (shouldRecordCase(finalProduct, { confidence: finalProduct.confidence ?? 0, quality: (finalProduct.quality ?? 'low') as any, flags: finalProduct.qualityFlags ?? [] })) {
+          (finalProduct as any).caseId = recordCase({ asin: item.asin, marketplaceId: item.marketplaceId, product: finalProduct, note: 'bulk drainPending result' });
+        }
+        stripInternalEvidence(finalProduct as any);
+        this.store.completeBulkItem(jobId, finalProduct);
+        this.store.save(finalProduct);
+      } else {
+        recordCase({ asin: item.asin, marketplaceId: item.marketplaceId, product: null, errorMessage: finalReason ?? 'Failed after retries', note: 'bulk drainPending failed' });
+        this.store.failBulkItem(jobId, item.marketplaceId, item.asin, finalReason ?? 'Failed after retries');
       }
     }
   }

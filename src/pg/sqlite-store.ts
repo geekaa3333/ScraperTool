@@ -1733,6 +1733,18 @@ const JOB_SELECT = `
 
 function toJobSummary(row: Record<string, unknown>): JobSummary {
   const csv = (row.marketplaces_csv as string) ?? '';
+  const rawSelected = row.selected_fields ?? row.selectedFields ?? null;
+  let selectedFields: string[] | null = null;
+  if (Array.isArray(rawSelected)) {
+    selectedFields = rawSelected.map((v) => String(v));
+  } else if (typeof rawSelected === 'string' && rawSelected.trim()) {
+    try {
+      const parsed = JSON.parse(rawSelected);
+      if (Array.isArray(parsed)) selectedFields = parsed.map((v) => String(v));
+    } catch {
+      selectedFields = null;
+    }
+  }
   return {
     jobId: row.job_id as string,
     jobName: (row.job_name as string) ?? null,
@@ -1752,5 +1764,6 @@ function toJobSummary(row: Record<string, unknown>): JobSummary {
     restrictedRecords: num0(row.restricted_records),
     totalSellerOffers: num0(row.total_seller_offers),
     reportCount: num0(row.report_count),
+    selectedFields,
   };
 }
